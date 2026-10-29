@@ -21,6 +21,7 @@ struct config{
     string chat_key=getenv("CLOVER_CHAT_KEY")?getenv("CLOVER_CHAT_KEY"):"";
     string web_key=getenv("CLOVER_WEB_KEY")?getenv("CLOVER_WEB_KEY"):"";
     string ctxfile="context.json";
+    string purpose;
 };
 
 // lazily (re)builds ssl clients when provider/key changes, since SSLClient is
@@ -287,7 +288,7 @@ class agent{
         web_backend& web;
         tool_context tools;
         context_store* store=nullptr;
-        int max_tool_rounds=32;
+        int max_tool_rounds=250;
         void save_ctx(){
             if (store) store->save(ctx, model, chat.provider);
         }
@@ -504,6 +505,10 @@ int main(int argc, char** argv){
         else if (a=="--ctx"){
             if (i+1>=argc){ cerr<<"--ctx requires a path\n"; return 2; }
             cfg.ctxfile=argv[++i];
+        }
+        else if (a=="--purpose"){
+            if (i+1>=argc){ cerr<<"--purpose requires a text\n"; return 2; }
+            cfg.purpose=argv[++i];
         } else if (a=="-h"||a=="--help"){
             cout<<"usage: "<<argv[0]<<" [-t|--test] [--ctx <path>]\n";
             cout<<"  -t, --test      read all stdin, run one turn, print result, exit\n";
@@ -538,6 +543,24 @@ int main(int argc, char** argv){
     stringstream buf; buf<<sysfile.rdbuf();
     string system_prompt=buf.str();
 
+    // a subagent is a copy of clover framed by a purpose: the purpose block
+    // leads the system prompt so it steers everything that follows.
+    if (!cfg.purpose.empty()){
+        system_prompt=
+            "# subagent\n"
+            "you are a subagent: a fresh copy of clover created for one purpose, isolated from the user.\n"
+            "\n"
+            "purpose: "+cfg.purpose+"\n"
+            "\n"
+            "# subagent principles\n"
+            "- do the task fully, then check your own work before reporting: re-verify critical facts, re-run key checks, and report only what you confirmed.\n"
+            "- your context and memory are scratch - nothing carries over. everything you need must be in the task; state any assumptions you make.\n"
+            "- you cannot ask the user questions. if the task is impossible or ambiguous, say so plainly instead of guessing.\n"
+            "- do not modify system files, do not touch the git repo, and do not spawn subagents unless the task requires it.\n"
+            "- keep the final report concise and factual.\n"
+            "\n\n"+system_prompt;
+    }
+
     // keys live in the environment now; refuse to start without them so a
     // missing key is a clear startup error, never a mystery network failure.
     if (cfg.chat_key.empty() || cfg.web_key.empty()){
@@ -548,6 +571,7 @@ int main(int argc, char** argv){
     web_backend web(cfg);
     context_store store(cfg.ctxfile);
     agent clover(cfg.model, system_prompt, "☘ clover", chat, web);
+    if (!cfg.purpose.empty()) clover.name="subagent";
     clover.tools.web_search=[&web](const string& q){ return web.search(q); };
     clover.store=&store;
     clover.load_from_store();
