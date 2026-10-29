@@ -1,0 +1,628 @@
+#include "../tool.h"
+#include <string>
+#include <vector>
+#include <deque>
+#include <optional>
+#include <algorithm>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <cctype>
+#include <ctime>
+#include <cerrno>
+#include <regex>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/file.h>
+#include <sys/stat.h>
+
+// memory: a permanent, append-only long-term memory for this agent, modeled
+// on OptMem (github.com/VictorTaelin/OptMem). memories are one-line entries
+// in LOG.txt as fixed-width records; aligned power-of-two blocks of the log
+// are summarized (by the model, on demand) into TREE/<size> files. wake
+// prints recent memories verbatim and older spans as summaries, within a
+// line budget. the log is the truth; the tree is a rebuildable cache.
+
+namespace {
+
+constexpr long long LOG_REC = 2048;     // bytes per memory record
+constexpr long long TREE_REC = 2048;    // bytes per summary record
+constexpr long long ENTRY_CHARS = 2000; // max bytes per memory line
+constexpr long long RAW_MAX = 16;       // blocks up to this size compress from raw lines
+constexpr long long WAKE_LINES = 96;    // wake line budget
+constexpr size_t PART_CHARS = 20000;    // wake pagination: max bytes per part
+constexpr size_t PART_LINES = 500;      // wake pagination: max lines per part
+
+std::string memory_dir(){
+    const char* env=getenv("MEMORY_DIR");
+    if (env && *env) return std::string(env);
+    const char* home=getenv("HOME");
+    return std::string(home?home:".")+"/memory";
+}
+
+std::string log_path(const std::string& d){ return d+"/LOG.txt"; }
+std::string tree_path(const std::string& d, long long size){ return d+"/TREE/"+std::to_string(size); }
+
+// advisory lock on <dir>/.lock: serializes appends against any other
+// process touching the same store.
+struct file_lock{
+    int fd=-1;
+    explicit file_lock(const std::string& path){
+        fd=open(path.c_str(), O_CREAT|O_RDWR, 0666);
+        if (fd>=0) flock(fd, LOCK_EX);
+    }
+    ~file_lock(){ if (fd>=0){ flock(fd, LOCK_UN); close(fd); } }
+    file_lock(const file_lock&)=delete;
+    file_lock& operator=(const file_lock&)=delete;
+};
+
+// ensures the store exists. unlike OptMem we auto-create on first use: the
+// identity question is already settled by the system prompt; this is a tool.
+bool ensure_store(const std::string& d, std::string& err){
+    if (mkdir(d.c_str(), 0777)!=0 && errno!=EEXIST){ err=d+": "+strerror(errno); return false; }
+    std::string t=d+"/TREE";
+    if (mkdir(t.c_str(), 0777)!=0 && errno!=EEXIST){ err=t+": "+strerror(errno); return false; }
+    int fd=open(log_path(d).c_str(), O_CREAT|O_WRONLY|O_APPEND, 0666);
+    if (fd<0){ err=log_path(d)+": "+strerror(errno); return false; }
+    close(fd);
+    return true;
+}
+
+// drops a partial trailing record left by a crash: it was never
+// acknowledged, and a misaligned tail would corrupt every later append.
+void repair(const std::string& path, long long rec){
+    struct stat st;
+    if (stat(path.c_str(), &st)!=0) return;
+    long long n=(long long)st.st_size;
+    if (n%rec){
+        int fd=open(path.c_str(), O_WRONLY);
+        if (fd>=0){ if (ftruncate(fd, n-n%rec)!=0){} close(fd); }
+    }
+}
+
+long long count_recs(const std::string& path, long long rec){
+    struct stat st;
+    if (stat(path.c_str(), &st)!=0) return 0; // missing level file is normal
+    return (long long)st.st_size/rec;
+}
+
+long long log_len(const std::string& d){ return count_recs(log_path(d), LOG_REC); }
+
+struct memory_rec{ long long id=-1; std::string date, text; };
+
+// parses "#<id> <date> <text>"; returns false on a malformed record.
+bool parse_rec(std::string line, memory_rec& out){
+    while (!line.empty() && (line.back()==' '||line.back()=='\n'||line.back()=='\r')) line.pop_back();
+    if (line.empty() || line[0]!='#') return false;
+    size_t p1=line.find(' ');
+    if (p1==std::string::npos || p1==1) return false;
+    std::string head=line.substr(1,p1-1);
+    for (char c: head) if (!isdigit((unsigned char)c)) return false;
+    size_t p2=line.find(' ', p1+1);
+    if (p2==std::string::npos) return false;
+    out.id=strtoll(head.c_str(), nullptr, 10);
+    out.date=line.substr(p1+1, p2-p1-1);
+    out.text=line.substr(p2+1);
+    return true;
+}
+
+std::vector<memory_rec> decode_recs(const std::string& buf, long long rec){
+    std::vector<memory_rec> out;
+    long long n=(long long)buf.size()/rec;
+    for (long long i=0;i<n;i++){
+        memory_rec r;
+        if (parse_rec(buf.substr((size_t)(i*rec), (size_t)rec), r)) out.push_back(r);
+    }
+    return out;
+}
+
+// ---------------------------------------------------------------- blocks
+
+// tiles [0,T) with aligned power-of-two blocks; a block stays whole iff its
+// size is at most alpha times its age (hi may exceed T only at the root).
+// bigger alpha = coarser = fewer lines. pure math, ported from OptMem.
+std::vector<std::pair<long long,long long>> cover_alpha(long long T, double alpha){
+    long long root=1;
+    while (root<T) root*=2;
+    std::vector<std::pair<long long,long long>> out;
+    std::vector<std::pair<long long,long long>> stack{{0,root}};
+    while (!stack.empty()){
+        auto [lo,hi]=stack.back(); stack.pop_back();
+        if (lo>=T) continue;
+        long long size=hi-lo;
+        if (size>1 && (hi>T || (double)size>alpha*(double)(T-lo))){
+            long long mid=(lo+hi)/2;
+            stack.push_back({mid,hi});
+            stack.push_back({lo,mid});
+        } else {
+            out.push_back({lo,hi});
+        }
+    }
+    std::sort(out.begin(), out.end());
+    return out;
+}
+
+// the blocks wake prints: at most `budget`, finest near the present.
+// binary-searches alpha, then splits remaining blocks, spending leftover
+// budget on the most recent span.
+std::vector<std::pair<long long,long long>> cover(long long T, long long budget){
+    if (T<=0) return {};
+    if (T<=budget){
+        std::vector<std::pair<long long,long long>> out;
+        for (long long i=0;i<T;i++) out.push_back({i,i+1});
+        return out;
+    }
+    double lo=0.0, hi=1.0;
+    for (int i=0;i<60;i++){
+        double mid=(lo+hi)/2;
+        if ((long long)cover_alpha(T,mid).size()>budget) lo=mid; else hi=mid;
+    }
+    auto out=cover_alpha(T,hi);
+    while ((long long)out.size()<budget){
+        int best=-1;
+        for (size_t i=0;i<out.size();i++)
+            if (out[i].second-out[i].first>1) best=(int)i; // keep last (newest)
+        if (best<0) break;
+        auto [lo_,hi_]=out[best];
+        long long mid=(lo_+hi_)/2;
+        out.erase(out.begin()+best);
+        out.insert(out.begin()+best, {mid,hi_});
+        out.insert(out.begin()+best, {lo_,mid});
+    }
+    return out;
+}
+
+// ---------------------------------------------------------------- i/o
+
+// reads records [lo,hi) of a fixed-width file in one read.
+std::vector<memory_rec> file_slice(const std::string& path, long long rec, long long lo, long long hi){
+    std::vector<memory_rec> out;
+    int fd=open(path.c_str(), O_RDONLY);
+    if (fd<0) return out;
+    std::string buf((size_t)((hi-lo)*rec), '\0');
+    ssize_t got=0, need=(ssize_t)((hi-lo)*rec);
+    lseek(fd, lo*rec, SEEK_SET);
+    while (got<need){
+        ssize_t n=read(fd, buf.data()+got, (size_t)(need-got));
+        if (n<=0) break;
+        got+=n;
+    }
+    close(fd);
+    if (got==need) out=decode_recs(buf, rec);
+    return out;
+}
+
+memory_rec log_get(const std::string& d, long long i){
+    auto v=file_slice(log_path(d), LOG_REC, i, i+1);
+    return v.empty()? memory_rec{} : v[0];
+}
+
+// summary of block [lo,hi): empty string if not built (or blank).
+std::string tree_get(const std::string& d, long long lo, long long hi){
+    long long size=hi-lo;
+    int fd=open(tree_path(d,size).c_str(), O_RDONLY);
+    if (fd<0) return "";
+    std::string buf((size_t)TREE_REC, '\0');
+    lseek(fd, (lo/size)*TREE_REC, SEEK_SET);
+    ssize_t got=0;
+    while (got<TREE_REC){
+        ssize_t n=read(fd, buf.data()+got, (size_t)(TREE_REC-got));
+        if (n<=0) break;
+        got+=n;
+    }
+    close(fd);
+    if (got<=0) return "";
+    std::string s=buf.substr(0,(size_t)got);
+    while (!s.empty() && (s.back()==' '||s.back()=='\n')) s.pop_back();
+    return s;
+}
+
+// writes the summary of block [lo,hi). blocks are built in order, so this
+// must append exactly record lo/size to that level file; anything else means
+// a concurrent writer got there first, and we report failure.
+bool tree_put(const std::string& d, long long lo, long long hi, const std::string& text, std::string& err){
+    long long size=hi-lo;
+    file_lock lk(d+"/.lock");
+    if (lk.fd<0){ err="cannot open lock file"; return false; }
+    std::string p=tree_path(d,size);
+    repair(p, TREE_REC);
+    if (count_recs(p, TREE_REC)!=lo/size) return false; // settled meanwhile
+    if ((long long)text.size()>TREE_REC-1){ err="summary too long"; return false; }
+    const std::string& line=text;
+    int fd=open(p.c_str(), O_CREAT|O_WRONLY|O_APPEND, 0666);
+    if (fd<0){ err=p+": "+strerror(errno); return false; }
+    std::string rec=line;
+    rec.resize((size_t)(TREE_REC-1), ' ');
+    rec+='\n';
+    ssize_t w=write(fd, rec.data(), rec.size());
+    fsync(fd);
+    close(fd);
+    if (w!=(ssize_t)rec.size()){ err="short write to "+p; return false; }
+    return true;
+}
+
+// forget block [lo,hi) and everything derived above it: truncate each level
+// back to that point. later blocks at those levels go too and are rebuilt;
+// the log is never touched, so nothing is truly lost. returns dropped spans.
+std::vector<std::pair<long long,long long>> tree_drop(const std::string& d, long long lo, long long hi){
+    std::vector<std::pair<long long,long long>> gone;
+    long long size=hi-lo, T=log_len(d);
+    file_lock lk(d+"/.lock");
+    while (size<=T){
+        std::string p=tree_path(d,size);
+        long long k=lo/size, n=count_recs(p, TREE_REC);
+        if (n>k){
+            for (long long i=k;i<n;i++) gone.push_back({i*size,(i+1)*size});
+            int fd=open(p.c_str(), O_WRONLY);
+            if (fd>=0){ if (ftruncate(fd, k*TREE_REC)!=0){} fsync(fd); close(fd); }
+        }
+        size*=2;
+    }
+    return gone;
+}
+
+// the only way LOG.txt ever grows. ids are assigned inside the lock so two
+// processes noting at once cannot take the same id. returns first id used.
+long long log_append(const std::string& d, const std::vector<std::pair<std::string,std::string>>& items, std::string& err){
+    file_lock lk(d+"/.lock");
+    if (lk.fd<0){ err="cannot open lock file"; return -1; }
+    std::string p=log_path(d);
+    repair(p, LOG_REC);
+    long long base=count_recs(p, LOG_REC);
+    int fd=open(p.c_str(), O_WRONLY|O_APPEND);
+    if (fd<0){ err=p+": "+strerror(errno); return -1; }
+    for (size_t k=0;k<items.size();k++){
+        std::string line="#"+std::to_string(base+(long long)k)+" "+items[k].first+" "+items[k].second;
+        if ((long long)line.size()>LOG_REC-1){ close(fd); err="memory too long (internal)"; return -1; }
+        std::string rec=line;
+        rec.resize((size_t)(LOG_REC-1), ' ');
+        rec+='\n';
+        if (write(fd, rec.data(), rec.size())!=(ssize_t)rec.size()){ close(fd); err="short write"; return -1; }
+    }
+    fsync(fd);
+    close(fd);
+    return base;
+}
+
+// ---------------------------------------------------------------- naps
+
+// blocks that can be built but have not been, smallest first. each level
+// file is a dense prefix, so its length says exactly how far it got: one
+// stat per level, never a scan.
+std::vector<std::pair<long long,long long>> pending(const std::string& d, long long T, long long limit){
+    std::vector<std::pair<long long,long long>> todo;
+    for (long long size=2; size<=T; size*=2){
+        long long have=count_recs(tree_path(d,size), TREE_REC);
+        for (long long k=have; k<T/size; k++){
+            todo.push_back({k*size,(k+1)*size});
+            if (limit>0 && (long long)todo.size()>=limit) return todo;
+        }
+    }
+    return todo;
+}
+
+long long pending_count(const std::string& d, long long T){
+    long long n=0;
+    for (long long size=2; size<=T; size*=2)
+        n+=std::max(0LL, T/size-count_recs(tree_path(d,size), TREE_REC));
+    return n;
+}
+
+// the compression request handed to the model: compress memories [lo,hi)
+// into one line. blocks <= RAW_MAX show raw lines; larger blocks show their
+// two half-summaries (which pending() guarantees are settled).
+std::string nap_prompt(const std::string& d, long long lo, long long hi, long long left){
+    std::string body;
+    if (hi-lo<=RAW_MAX){
+        auto recs=file_slice(log_path(d), LOG_REC, lo, hi);
+        for (auto& r: recs){
+            body+=std::string("  #")+std::to_string(r.id)+" "+r.date+" "+r.text+"\n";
+        }
+    } else {
+        long long mid=(lo+hi)/2;
+        for (auto [a,b] : {std::pair<long long,long long>{lo,mid},{mid,hi}}){
+            std::string s=tree_get(d,a,b);
+            if (s.empty()) return std::string(); // corrupt; forget and rebuild
+            body+=std::string("  #")+std::to_string(a)+"-"+std::to_string(b-1)+" "+s+"\n";
+        }
+    }
+    std::string tail;
+    if (left>0){
+        tail=std::string("\n")+std::to_string(left);
+        tail+=(left==1)?" compression remains":" compressions remain";
+        tail+=" after this one.\n";
+    }
+    std::string q(1, '"');
+    std::string out="compression needed: compress memories #"+std::to_string(lo)+"-"+std::to_string(hi-1);
+    out+=" into ONE line of at most "+std::to_string(ENTRY_CHARS)+" bytes.";
+    out+=" keep what has lasting effect, drop the rest, invent nothing.\n";
+    out+=body+tail;
+    out+="reply with a tool call: memory_nap block="+q+std::to_string(lo)+"-"+std::to_string(hi-1)+q;
+    out+=" summary="+q+"<your one line>"+q;
+    return out;
+}
+
+std::string next_nap(const std::string& d, long long T, long long& count_out){
+    auto todo=pending(d,T,1);
+    count_out=pending_count(d,T);
+    if (todo.empty()) return std::string();
+    return nap_prompt(d, todo[0].first, todo[0].second, count_out-1);
+}
+
+// ---------------------------------------------------------------- tools
+
+std::string sarg(const nlohmann::json& args, const char* key, std::string& err){
+    if (!args.contains(key) || !args[key].is_string()){
+        err=std::string("missing or non-string argument: ")+key;
+        return "";
+    }
+    return args[key].get<std::string>();
+}
+
+std::string today(){
+    auto t=std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
+    struct tm tmv; gmtime_r(&t,&tmv);
+    char b[16]; strftime(b,sizeof(b),"%Y-%m-%d",&tmv);
+    return b;
+}
+
+// validates and normalizes a memory line: nonempty, no newlines, within
+// the entry budget. returns empty string + sets err on failure.
+std::string check_text(const std::string& raw, std::string& err){
+    std::string text=raw;
+    while (!text.empty() && (text.back()==' '||text.back()=='\t')) text.pop_back();
+    size_t start=text.find_first_not_of(" \t");
+    if (start!=std::string::npos) text=text.substr(start); else text="";
+    if (text.empty()){ err="empty. a memory is one line of text."; return ""; }
+    if (text.find('\n')!=std::string::npos || text.find('\r')!=std::string::npos){
+        err="multiple lines. a memory is one line: merge them or note them separately."; return "";
+    }
+    if ((long long)text.size()>(long long)ENTRY_CHARS){
+        err="too long: "+std::to_string(text.size())+" bytes, limit "+std::to_string(ENTRY_CHARS)+"."; return "";
+    }
+    return text;
+}
+
+// parses "lo-hi" (inclusive, as printed) into [lo,hi). must be a real
+// block: an aligned power-of-two range of at least two memories.
+bool parse_block(const std::string& s, long long& lo, long long& hi, std::string& err){
+    static std::regex re("^(\\d+)-(\\d+)$");
+    std::smatch m;
+    if (!std::regex_match(s, m, re)){ err="'"+s+"' is not a block id. copy it from the tool output."; return false; }
+    lo=atoll(m[1].str().c_str());
+    hi=atoll(m[2].str().c_str())+1;
+    long long n=hi-lo;
+    if (n<2 || (n&(n-1)) || lo%n){
+        err="'"+s+"' is not an aligned power-of-two block."; return false;
+    }
+    return true;
+}
+
+std::string memory_note(const nlohmann::json& args, tool_context&){
+    std::string err, text=sarg(args,"text",err);
+    if (!err.empty()) return "error: "+err+"\n";
+    text=check_text(text,err);
+    if (!err.empty()) return "error: "+err+"\n";
+    std::string d=memory_dir();
+    if (!ensure_store(d,err)) return "error: "+err+"\n";
+    long long i=log_append(d, {{today(), text}}, err);
+    if (i<0) return "error: "+err+"\n";
+    std::string out="saved as #"+std::to_string(i)+".\n";
+    long long cnt=0;
+    std::string nap=next_nap(d, i+1, cnt);
+    if (!nap.empty()) out+="\n"+nap+"\n";
+    return out;
+}
+
+std::string memory_nap(const nlohmann::json& args, tool_context&){
+    std::string d=memory_dir(), err;
+    if (!ensure_store(d,err)) return "error: "+err+"\n";
+    long long T=log_len(d);
+    bool said=false;
+    if (args.contains("block")){
+        said=true;
+        std::string block, summary;
+        block=sarg(args,"block",err); if (!err.empty()) return "error: "+err+"\n";
+        summary=sarg(args,"summary",err); if (!err.empty()) return "error: "+err+"\n";
+        long long lo,hi;
+        if (!parse_block(block,lo,hi,err)) return "error: "+err+"\n";
+        auto todo=pending(d,T,1);
+        if (todo.empty()) return "nothing left to compress.\n";
+        if (lo!=todo[0].first || hi!=todo[0].second){
+            if (!tree_get(d,lo,hi).empty())
+                return std::to_string(lo)+"-"+std::to_string(hi-1)+" is already settled.\n";
+            return "error: wrong block: "+block+". blocks are built in order; the next is "+
+                   std::to_string(todo[0].first)+"-"+std::to_string(todo[0].second-1)+".\n";
+        }
+        summary=check_text(summary,err);
+        if (!err.empty()) return "error: "+err+"\n";
+        if (!tree_put(d,lo,hi,summary,err)){
+            if (!err.empty()) return "error: "+err+"\n";
+            return std::to_string(lo)+"-"+std::to_string(hi-1)+" was settled or forgotten meanwhile.\n";
+        }
+        T=log_len(d); // a note may have landed meanwhile
+    }
+    long long cnt=0;
+    std::string nap=next_nap(d,T,cnt);
+    if (nap.empty()) return "nothing left to compress.\n";
+    return (said?"\n":"")+nap+"\n";
+}
+
+// splits rendered wake lines into parts that survive output caps.
+std::vector<std::vector<std::string>> paginate(const std::vector<std::string>& lines){
+    std::vector<std::vector<std::string>> parts;
+    std::vector<std::string> cur;
+    size_t size=0;
+    for (auto& line: lines){
+        size_t n=line.size()+1;
+        if (!cur.empty() && (cur.size()>=PART_LINES || size+n>PART_CHARS)){
+            parts.push_back(cur); cur.clear(); size=0;
+        }
+        cur.push_back(line); size+=n;
+    }
+    if (!cur.empty()) parts.push_back(cur);
+    return parts;
+}
+
+std::string memory_wake(const nlohmann::json& args, tool_context&){
+    std::string d=memory_dir(), err;
+    if (!ensure_store(d,err)) return "error: "+err+"\n";
+    long long now=log_len(d);
+    long long k=1, T=now;
+    if (args.contains("part")){
+        if (!args["part"].is_number_integer()) return "error: 'part' must be an integer.\n";
+        k=args["part"].get<long long>();
+        if (args.contains("T")){
+            if (!args["T"].is_number_integer()) return "error: 'T' must be an integer.\n";
+            T=args["T"].get<long long>();
+            if (T>now) return "error: T="+std::to_string(T)+" but the log holds "+std::to_string(now)+" memories.\n";
+        }
+    }
+    if (T<=0) return "no memories yet. record the first with memory_note.\nyou are awake.\n";
+    std::vector<std::string> lines;
+    for (auto [lo,hi] : cover(T, WAKE_LINES)){
+        if (hi-lo==1){
+            auto r=log_get(d,lo);
+            if (r.id<0) return "error: corrupt log record at #"+std::to_string(lo)+".\n";
+            lines.push_back("#"+std::to_string(r.id)+" "+r.date+" "+r.text);
+        } else {
+            std::string s=tree_get(d,lo,hi);
+            if (s.empty()){
+                long long cnt=0;
+                std::string nap=next_nap(d,T,cnt);
+                if (!nap.empty())
+                    return "cannot wake: the memory context needs #"+std::to_string(lo)+"-"+std::to_string(hi-1)+
+                           ", which is not compressed yet.\ndo the compression below, then call memory_wake again.\n\n"+nap+"\n";
+                return "error: the summary of #"+std::to_string(lo)+"-"+std::to_string(hi-1)+" is blank. run memory_forget on it and let nap rebuild.\n";
+            }
+            lines.push_back("#"+std::to_string(lo)+"-"+std::to_string(hi-1)+" "+s);
+        }
+    }
+    auto parts=paginate(lines);
+    if (k<1 || k>(long long)parts.size())
+        return "error: no part "+std::to_string(k)+": the memory has "+std::to_string(parts.size())+" part(s).\n";
+    std::string out;
+    if (parts.size()>1)
+        out="your memory, part "+std::to_string(k)+" of "+std::to_string(parts.size())+", oldest first ("+std::to_string(T)+" memories).\n";
+    for (auto& l: parts[k-1]) out+=l+"\n";
+    if (k<(long long)parts.size())
+        out+="not awake yet. call memory_wake with part="+std::to_string(k+1)+" T="+std::to_string(T)+"\n";
+    else {
+        out+="you are awake.\n";
+        long long cnt=0;
+        std::string nap=next_nap(d,T,cnt);
+        if (!nap.empty()) out+="\n"+nap+"\n";
+    }
+    return out;
+}
+
+std::string memory_recall(const nlohmann::json& args, tool_context&){
+    std::string err, pat=sarg(args,"pattern",err);
+    if (!err.empty()) return "error: "+err+"\n";
+    std::regex re;
+    try{ re=std::regex(pat, std::regex::icase); }
+    catch (const std::regex_error& e){ return std::string("error: bad pattern: ")+e.what()+"\n"; }
+    std::string d=memory_dir();
+    if (!ensure_store(d,err)) return "error: "+err+"\n";
+    long long hits=0;
+    std::deque<std::string> out;
+    size_t size=0;
+    int fd=open(log_path(d).c_str(), O_RDONLY);
+    if (fd<0) return "error: cannot open log.\n";
+    std::string buf((size_t)(4096*LOG_REC), '\0');
+    while (true){
+        ssize_t need=4096*LOG_REC;
+        ssize_t got=0;
+        while (got<need){
+            ssize_t n=read(fd, buf.data()+got, (size_t)(need-got));
+            if (n<=0) break;
+            got+=n;
+        }
+        if (got<=0) break;
+        auto recs=decode_recs(buf.substr(0,(size_t)got), LOG_REC);
+        for (auto& r: recs){
+            std::string line="#"+std::to_string(r.id)+" "+r.date+" "+r.text;
+            if (!std::regex_search(line, re)) continue;
+            hits++;
+            out.push_back(line);
+            size+=line.size()+1;
+            while (size>PART_CHARS && out.size()>1){
+                size-=out.front().size()+1;
+                out.pop_front();
+            }
+        }
+        if (got<need) break;
+    }
+    close(fd);
+    if (!hits) return "no match.\n";
+    std::string result;
+    for (auto& l: out) result+=l+"\n";
+    if ((long long)out.size()<hits)
+        result+="newest "+std::to_string(out.size())+" of "+std::to_string(hits)+" matches. narrow the pattern.\n";
+    else
+        result+=std::to_string(hits)+(hits==1?" match.":" matches.");
+    result+="\n";
+    return result;
+}
+
+std::string memory_zoom(const nlohmann::json& args, tool_context&){
+    std::string err, block=sarg(args,"block",err);
+    if (!err.empty()) return "error: "+err+"\n";
+    long long lo,hi;
+    if (!parse_block(block,lo,hi,err)) return "error: "+err+"\n";
+    std::string d=memory_dir();
+    if (!ensure_store(d,err)) return "error: "+err+"\n";
+    long long T=log_len(d);
+    if (lo>=T) return "error: #"+block+" is beyond the memory: it holds "+std::to_string(T)+" memories.\n";
+    std::string out;
+    long long mid=(lo+hi)/2;
+    for (auto [a,b] : {std::pair<long long,long long>{lo,mid},{mid,hi}}){
+        if (a>=T) continue;
+        if (b-a==1){
+            auto r=log_get(d,a);
+            out+="#"+std::to_string(r.id)+" "+r.date+" "+r.text+"\n";
+        } else {
+            std::string s=tree_get(d,a,b);
+            out+="#"+std::to_string(a)+"-"+std::to_string(b-1)+" "+(s.empty()?"not compressed yet":s)+"\n";
+        }
+    }
+    return out;
+}
+
+std::string memory_forget(const nlohmann::json& args, tool_context&){
+    std::string err, block=sarg(args,"block",err);
+    if (!err.empty()) return "error: "+err+"\n";
+    long long lo,hi;
+    if (!parse_block(block,lo,hi,err)) return "error: "+err+"\n";
+    std::string d=memory_dir();
+    if (!ensure_store(d,err)) return "error: "+err+"\n";
+    auto gone=tree_drop(d,lo,hi);
+    if (gone.empty()) return "error: no summary at "+block+".\n";
+    std::string out="forgot "+std::to_string(gone.size())+" summar"+(gone.size()==1?"y":"ies")+
+                    ", from #"+std::to_string(gone[0].first)+"-"+std::to_string(gone[0].second-1)+" up. run memory_nap to rebuild.\n";
+    return out;
+}
+
+} // namespace
+
+REGISTER_TOOL_DESC("memory_note", memory_note,
+R"(memory_note(text):
+-records one long-term memory: one line, up to 2000 bytes
+-call it whenever something of lasting value happens; if the reply contains a compression prompt, do it before anything else)");
+REGISTER_TOOL_DESC("memory_nap", memory_nap,
+R"(memory_nap(block, summary):
+-answers a pending compression: block like "0-3", summary is my one-line compression of those memories
+-called with no arguments, prints the next pending compression)");
+REGISTER_TOOL_DESC("memory_wake", memory_wake,
+R"(memory_wake():
+-reads my long-term memory. run it first, every session, and follow what it prints until it says i am awake
+-optional args: part (integer), T (integer snapshot), for continuing a multi-part read)");
+REGISTER_TOOL_DESC("memory_recall", memory_recall,
+R"(memory_recall(pattern):
+-case-insensitive regex search across every memory ever recorded)");
+REGISTER_TOOL_DESC("memory_zoom", memory_zoom,
+R"(memory_zoom(block):
+-opens one memory tree node, e.g. "0-15", into its two halves)");
+REGISTER_TOOL_DESC("memory_forget", memory_forget,
+R"(memory_forget(block):
+-drops a bad summary and everything built on it; nap rebuilds it)");

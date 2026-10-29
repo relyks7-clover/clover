@@ -1,0 +1,28 @@
+#include "../tool.h"
+#include <cstdio>
+#include <string>
+#include <sys/wait.h>
+
+static std::string tool_run_command(const nlohmann::json& args, tool_context&){
+    if (!args.contains("command"))
+        return "error: missing 'command' argument\n";
+    std::string rcommand=args["command"].get<std::string>();
+    std::string command="'";
+    for (char c:rcommand){
+        if (c=='\'') command+="'\\''";
+        else command+=c;
+    }
+    command+="'";
+    std::string full_command="bash -lc "+command+" 2>&1";
+    FILE* pipe=popen(full_command.c_str(), "r");
+    if (!pipe) return "popen failed";
+    std::string output;
+    for (int c; (c=fgetc(pipe))!=EOF;) output.push_back(static_cast<char>(c));
+    int status=pclose(pipe);
+    int excode=-1;
+    if (WIFEXITED(status)) excode=WEXITSTATUS(status);
+    else if (WIFSIGNALED(status)) excode=128+WTERMSIG(status);
+    return "exit code: "+std::to_string(excode)+"\nresult: "+output+'\n';
+}
+
+REGISTER_TOOL("run_command", tool_run_command);

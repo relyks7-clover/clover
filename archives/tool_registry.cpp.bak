@@ -1,0 +1,34 @@
+#include "tool.h"
+#include <map>
+#include <mutex>
+
+static std::map<std::string, tool>& registry(){
+    static std::map<std::string, tool> r;
+    return r;
+}
+static std::vector<std::string>& order(){
+    static std::vector<std::string> o;
+    return o;
+}
+
+void register_tool(tool t){
+    auto& r=registry();
+    if (r.find(t.name)!=r.end()){
+        // last registration wins; keeps behavior predictable if two files
+        // declare the same name.
+        r[t.name]=std::move(t);
+        return;
+    }
+    order().push_back(t.name);
+    r[t.name]=std::move(t);
+}
+
+const tool* find_tool(const std::string& name){
+    auto& r=registry();
+    auto it=r.find(name);
+    return it==r.end() ? nullptr : &it->second;
+}
+
+std::vector<std::string> tool_names(){
+    return order();
+}

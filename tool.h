@@ -1,0 +1,35 @@
+#pragma once
+#include <string>
+#include <vector>
+#include <functional>
+#include "json.hpp"
+
+// services a tool may use. keeps tools decoupled from backend types: the
+// host supplies callables. add fields here as new shared services appear.
+struct tool_context{
+    std::function<std::string(const std::string& query)> web_search;
+};
+
+struct tool{
+    std::string name;
+    std::string desc; // signature + behavior, rendered into the system prompt
+    std::function<std::string(const nlohmann::json& args, tool_context& ctx)> run;
+};
+
+// registration is self-service: a tool file declares a static object that
+// registers itself at load time. the host only needs to link the .cpp in.
+void register_tool(tool t);
+const tool* find_tool(const std::string& name);
+std::vector<std::string> tool_names();
+std::string render_tools(); // the system prompt section for all registered tools
+
+// name is the tool's dispatch name; fn is a function-like taking
+// (const json& args, tool_context& ctx) and returning a string.
+#define REGISTER_TOOL_II(toolname, fn, n) static bool _tool_reg_##n = (register_tool({toolname, fn}), true)
+#define REGISTER_TOOL_I(toolname, fn, n) REGISTER_TOOL_II(toolname, fn, n)
+#define REGISTER_TOOL(toolname, fn) REGISTER_TOOL_I(toolname, fn, __LINE__)
+
+#define REGISTER_TOOL_DESC_III(toolname, fn, desc, n) static bool _tool_reg_##n = (register_tool({toolname, desc, fn}), true)
+#define REGISTER_TOOL_DESC_II(toolname, fn, desc, n) REGISTER_TOOL_DESC_III(toolname, fn, desc, n)
+#define REGISTER_TOOL_DESC_I(toolname, fn, desc, n) REGISTER_TOOL_DESC_II(toolname, fn, desc, n)
+#define REGISTER_TOOL_DESC(toolname, fn, desc) REGISTER_TOOL_DESC_I(toolname, fn, desc, __LINE__)

@@ -1,0 +1,238 @@
+#include "../tool.h"
+#include <string>
+#include <map>
+#include <mutex>
+#include <cstring>
+#include <cerrno>
+#include <cstdio>
+#include <unistd.h>
+#include <fcntl.h>
+#include <poll.h>
+#include <pty.h>
+#include <signal.h>
+#include <termios.h>
+#include <sys/wait.h>
+#include <chrono>
+
+// run_command runs shell commands. commands that prompt for input are run on
+// a pseudo-terminal so they behave as if interactive; when the child goes idle
+// while still alive we hand control back to the model, which replies with the
+// input to send (via a follow-up call carrying session_id + input). this lets
+// the model drive multi-prompt flows instead of hanging.
+
+namespace {
+
+constexpr int IDLE_MS = 1200;          // no-output window that means "probably waiting"
+constexpr size_t MAX_OUT = 256*1024;   // cap retained output per session
+
+struct session{
+    pid_t pid=-1;
+    int fd=-1;
+    std::string out;
+    bool alive=false;
+};
+
+std::mutex g_mu;
+std::map<int, session> g_sessions;
+int g_next_id=1;
+
+// append child output, capping size
+void append(session& s, const char* buf, size_t n){
+    s.out.append(buf, n);
+    if (s.out.size()>MAX_OUT*2)
+        s.out.erase(0, s.out.size()-MAX_OUT);
+}
+
+// drain available bytes without blocking. returns true if child stopped
+// producing (idle) while still alive.
+bool pump(session& s, int idle_ms){
+    char buf[4096];
+    for(;;){
+        struct pollfd pfd{s.fd, POLLIN, 0};
+        int pr=poll(&pfd, 1, idle_ms);
+        if (pr<0){
+            if (errno==EINTR) continue;
+            return false;
+        }
+        if (pr==0) return true; // timeout: idle, child still alive -> likely prompt
+        if (pfd.revents & (POLLIN|POLLHUP|POLLERR)){
+            ssize_t n=read(s.fd, buf, sizeof(buf));
+            if (n>0){ append(s, buf, (size_t)n); continue; }
+            // n==0 or error/EIO => child side closed
+            return false;
+        }
+    }
+}
+
+// reap and record final status; returns wait status or -1 if still running.
+int try_reap(session& s){
+    int st=0;
+    pid_t r=waitpid(s.pid, &st, WNOHANG);
+    if (r==s.pid) return st;
+    return -1;
+}
+
+int exit_code_from(int st){
+    if (WIFEXITED(st)) return WEXITSTATUS(st);
+    if (WIFSIGNALED(st)) return 128+WTERMSIG(st);
+    return -1;
+}
+
+void close_session(session& s){
+    if (s.fd>=0){ close(s.fd); s.fd=-1; }
+    s.alive=false;
+}
+
+std::string trim_tail(const std::string& s, size_t n=400){
+    if (s.size()<=n) return s;
+    size_t start=s.size()-n;
+    // don't split a utf8/escape mid-way; best effort
+    return s.substr(start);
+}
+
+// build the message returned to the model for a paused session
+std::string paused_message(int id, const std::string& tail){
+    std::string r;
+    r+="command is waiting for input (session_id: "+std::to_string(id)+")\n";
+    r+="output so far:\n"+tail;
+    if (!tail.empty() && tail.back()!='\n') r+="\n";
+    r+="---\n";
+    r+="if it is prompting, reply by calling run_command again with {\"session_id\": "+std::to_string(id)+", \"input\": \"<text to send>\"}. ";
+    r+="the input is sent as one line. to abandon it, call run_command with {\"session_id\": "+std::to_string(id)+", \"cancel\": true}. ";
+    r+="if you believe it is merely slow rather than prompting, you may send empty input to keep waiting.";
+    return r;
+}
+
+// drain any remaining buffered bytes (non-blocking)
+void drain(session& s){
+    char buf[4096];
+    for(;;){
+        ssize_t n=read(s.fd, buf, sizeof(buf));
+        if (n>0){ append(s, buf, (size_t)n); continue; }
+        break;
+    }
+}
+
+std::string finish_message(int st, const std::string& out){
+    return "exit code: "+std::to_string(exit_code_from(st))+"\nresult: "+out+'\n';
+}
+
+// run until the child exits or goes idle. sets finished=true when the child
+// is done (caller drops the session); finished=false means it is paused at a
+// prompt and the caller keeps the session.
+bool drive(session& s, std::string& result, bool& finished){
+    bool idle=pump(s, IDLE_MS);
+    if (idle){
+        // alive but quiet. it may be prompting, or exiting right now (the pty
+        // can go quiet a beat before EOF). short grace to catch imminent exit
+        // or trailing output before we commit to "paused".
+        for (int i=0; i<8 && idle; i++){
+            int st0=try_reap(s);
+            if (st0!=-1){ drain(s); result=finish_message(st0, s.out); finished=true; return true; }
+            bool still=pump(s, 50);
+            if (!still) idle=false; // got EOF/EIO: child is exiting
+        }
+    }
+    if (!idle){
+        // pty closed: the child is exiting/exited. blocking reap is correct
+        // here (WNOHANG can miss the status for a moment after EOF).
+        int st=0;
+        while (waitpid(s.pid, &st, 0)<0 && errno==EINTR) {}
+        drain(s);
+        result=finish_message(st, s.out);
+        finished=true;
+        return true;
+    }
+    // idle and still alive: paused at a prompt.
+    finished=false;
+    return true;
+}
+
+} // namespace
+
+static std::string tool_run_command(const nlohmann::json& args, tool_context&){
+    if (!args.is_object()) return "error: run_command expects an object argument\n";
+    std::lock_guard<std::mutex> lk(g_mu);
+
+    // --- cancel path ---
+    bool cancel=args.value("cancel", false);
+    if (args.contains("session_id") && cancel){
+        int id=args["session_id"].get<int>();
+        auto it=g_sessions.find(id);
+        if (it==g_sessions.end()) return "error: no such session "+std::to_string(id)+"\n";
+        session& s=it->second;
+        if (s.pid>0) kill(s.pid, SIGKILL);
+        int st=0; waitpid(s.pid, &st, 0);
+        close_session(s);
+        std::string r="session "+std::to_string(id)+" cancelled\n";
+        g_sessions.erase(it);
+        return r;
+    }
+
+    // --- continue existing session ---
+    if (args.contains("session_id")){
+        int id=args["session_id"].get<int>();
+        auto it=g_sessions.find(id);
+        if (it==g_sessions.end()) return "error: no such session "+std::to_string(id)+"\n";
+        session& s=it->second;
+        std::string in=args.value("input", std::string(""));
+        std::string line=in+"\n";
+        ssize_t w=write(s.fd, line.data(), line.size());
+        if (w<0) return std::string("error: write to session failed: ")+strerror(errno)+"\n";
+        std::string result; bool finished=false;
+        bool ok=drive(s, result, finished);
+        if (finished){ close_session(s); g_sessions.erase(it); return result; }
+        if (ok){ return paused_message(id, trim_tail(s.out)); }
+        // not finished but not idle either (rare); keep session, report tail
+        return paused_message(id, trim_tail(s.out));
+    }
+
+    // --- new command ---
+    if (!args.contains("command"))
+        return "error: missing 'command' argument (or provide session_id to continue a session)\n";
+    std::string rcommand=args["command"].get<std::string>();
+
+    std::string command="'";
+    for (char c:rcommand){
+        if (c=='\'') command+="'\\''";
+        else command+=c;
+    }
+    command+="'";
+    std::string shell="bash -lc "+command+" 2>&1";
+
+    // build a deterministic terminal mode. do NOT derive it from the parent's
+    // stdin: if stdin is a pipe/closed, tcgetattr fails and leaves VMIN=0,
+    // which makes the child's read() return EOF instantly instead of blocking.
+    struct termios ios;
+    memset(&ios, 0, sizeof(ios));
+    cfmakeraw(&ios);        // no echo, no cr translation, raw input
+    ios.c_cc[VMIN]=1;       // block until at least one byte -> real prompts wait
+    ios.c_cc[VTIME]=0;
+
+    int master=-1;
+    char namebuf[128];
+    pid_t pid=forkpty(&master, namebuf, &ios, NULL);
+    if (pid<0) return std::string("forkpty failed: ")+strerror(errno)+"\n";
+    if (pid==0){
+        // child
+        execl("/bin/bash", "bash", "-lc", shell.c_str(), (char*)nullptr);
+        _exit(127);
+    }
+    // parent
+    fcntl(master, F_SETFL, fcntl(master, F_GETFL, 0) | O_NONBLOCK);
+    int id=g_next_id++;
+    session s; s.pid=pid; s.fd=master; s.alive=true;
+
+    std::string result; bool finished=false;
+    bool ok=drive(s, result, finished);
+    if (finished){ close_session(s); return result; }
+    if (ok){
+        g_sessions[id]=std::move(s);
+        return paused_message(id, trim_tail(g_sessions[id].out));
+    }
+    // not idle, not finished (shouldn't normally happen); store and report
+    g_sessions[id]=std::move(s);
+    return paused_message(id, trim_tail(g_sessions[id].out));
+}
+
+REGISTER_TOOL("run_command", tool_run_command);

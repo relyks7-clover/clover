@@ -1,0 +1,18 @@
+# secrets - never in the repo
+.clover.env
+.ssh/
+
+# runtime state
+memory/
+context.json
+a.out
+*.o
+
+# shell/machine state, not project files
+.bash_history
+.bash_logout
+.bashrc
+.profile
+.viminfo
+.cache/
+.sudo_as_admin_successful
