@@ -1,5 +1,8 @@
 #include <bits/stdc++.h>
 #define CPPHTTPLIB_OPENSSL_SUPPORT
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <unistd.h>
 #include "httplib.h"
 #include "json.hpp"
 #include "tool.h"
@@ -200,6 +203,12 @@ class context_store{
             doc["provider"]=provider;
             doc["updated_at"]=iso8601_now();
             doc["messages"]=trim_context(messages);
+            // context holds private conversation state: new files are 0600,
+            // and an existing file keeps its current mode across the
+            // tmp+rename cycle (rename never carries modes itself).
+            mode_t newmode=0600;
+            struct stat st;
+            if (stat(path.c_str(), &st)==0) newmode=st.st_mode & 07777;
             string tmp=path+".tmp";
             {
                 ofstream f(tmp, ios::binary|ios::trunc);
@@ -207,6 +216,11 @@ class context_store{
                 f<<doc.dump(2);
                 f.flush();
                 if (!f.good()){ cerr<<"write error to "<<tmp<<"\n"; return false; }
+            }
+            if (chmod(tmp.c_str(), newmode)!=0){
+                cerr<<"cannot set permissions on "<<tmp<<": "<<strerror(errno)<<'\n';
+                unlink(tmp.c_str());
+                return false;
             }
             if (rename(tmp.c_str(), path.c_str())!=0){
                 cerr<<"cannot rename "<<tmp<<" to "<<path<<": "<<strerror(errno)<<"\n";
