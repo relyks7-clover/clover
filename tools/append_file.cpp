@@ -12,6 +12,10 @@ static std::string tool_append_file(const nlohmann::json& args, tool_context&){
     std::string path=args["path"].get<std::string>();
     std::string content=args["content"].get<std::string>();
     if (content.empty()) return "error: 'content' must not be empty\n";
+    // regular files only: opening a fifo for append would hang the agent
+    struct stat st;
+    if (stat(path.c_str(), &st)==0 && !S_ISREG(st.st_mode))
+        return "error: not a regular file: "+path+"\n";
     std::ofstream f(path, std::ios::binary|std::ios::app);
     if (!f.is_open()) return "error: cannot open "+path+" for appending\n";
     f<<content;
@@ -24,4 +28,5 @@ REGISTER_TOOL_DESC("append_file", tool_append_file,
 R"(append_file(path, content):
 -appends content to a file, creating it at 0600 if missing; binary-safe, no size cap
 -cheap in-place append (never rewrites the file): use for chunks, logs, incremental writes
+-regular files only (fifos/sockets rejected); empty content is rejected, the parent directory must exist
 -no lo/hi or anchors: read_file to inspect, edit_file to change existing text)");

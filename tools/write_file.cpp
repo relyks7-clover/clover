@@ -19,6 +19,8 @@ static std::string tool_write_file(const nlohmann::json& args, tool_context&){
     bool have_existing=false;
     struct stat st;
     if (stat(path.c_str(), &st)==0){ keep=st.st_mode & 07777; have_existing=true; }
+    if (have_existing && !S_ISREG(st.st_mode))
+        return "error: not a regular file: "+path+"\n";
     if (args.contains("mode") && args["mode"].is_number())
         keep=args["mode"].get<int>() & 07777;
     if (have_existing && args.value("exclusive", false))
@@ -40,5 +42,5 @@ REGISTER_TOOL_DESC("write_file", tool_write_file,
 R"(write_file(path, content, mode?, exclusive?):
 -creates or overwrites a file with exact content; binary-safe, 10MB cap
 -mode (optional octal int, e.g. 420 for 0644) only applies to new files; an existing file keeps its mode
--exclusive (optional bool): refuse to overwrite an existing file
+-exclusive (optional bool): refuse to overwrite an existing file; existing targets must be regular files (fifos/sockets rejected)
 -atomic tmp+rename write; for chunks use append_file, for a new big file write the first chunk then append)");

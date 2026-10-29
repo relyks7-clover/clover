@@ -13,6 +13,9 @@ static std::string tool_edit_file(const nlohmann::json& args, tool_context&){
     std::string old_s=args["old"].get<std::string>();
     std::string new_s=args["new"].get<std::string>();
     if (old_s.empty()) return "error: 'old' must not be empty\n";
+    struct stat stg;
+    if (stat(path.c_str(), &stg)!=0) return "error: cannot stat "+path+"\n";
+    if (!S_ISREG(stg.st_mode)) return "error: not a regular file: "+path+"\n";
     std::ifstream f(path, std::ios::binary);
     if (!f.is_open()) return "error: cannot open "+path+"\n";
     std::string data((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
@@ -41,6 +44,6 @@ static std::string tool_edit_file(const nlohmann::json& args, tool_context&){
 REGISTER_TOOL_DESC("edit_file", tool_edit_file,
 R"(edit_file(path, old, new):
 -surgical edit: 'old' must appear exactly once in the file; it is replaced by 'new'
--anchor not found and non-unique anchor are both errors - the tool never guesses
+-anchor not found and non-unique anchor are both errors - the tool never guesses; regular files only (fifos/sockets rejected)
 -preserves the file's mode; write is tmp+rename, atomic on posix
 -for new files use write via shell, or edit an existing template; binary files are not supported)");
