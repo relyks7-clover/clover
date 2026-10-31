@@ -17,3 +17,7 @@ a.out
 .cache/
 .sudo_as_admin_successful
 .lesshst
+browser-profile/
+browserenv/
+.config/
+.local/

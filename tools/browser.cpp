@@ -17,22 +17,12 @@ static std::string tool_browser(const nlohmann::json& args, tool_context&){
 
     nlohmann::json req;
     req["action"]=action;
-    if (args.contains("url") && args["url"].is_string())
-        req["url"]=args["url"];
-    if (args.contains("selector") && args["selector"].is_string())
-        req["selector"]=args["selector"];
-    if (args.contains("text") && args["text"].is_string())
-        req["text"]=args["text"];
-    if (args.contains("js") && args["js"].is_string())
-        req["js"]=args["js"];
-    if (args.contains("limit") && args["limit"].is_number())
-        req["limit"]=args["limit"];
-    if (args.contains("timeout") && args["timeout"].is_number())
-        req["timeout"]=args["timeout"];
-    if (args.contains("path") && args["path"].is_string())
-        req["path"]=args["path"];
-    if (args.contains("full") && args["full"].is_boolean())
-        req["full"]=args["full"];
+    // forward every other argument verbatim: the daemon is the protocol
+    // authority and new fields (src, op, key, ...) need no tool-side wiring
+    for (auto& [k,v] : args.items()){
+        if (k=="action") continue;
+        req[k]=v;
+    }
 
     std::string payload=req.dump()+"\n";
     if (payload.size()>512*1024)
@@ -104,7 +94,7 @@ static std::string tool_browser(const nlohmann::json& args, tool_context&){
 REGISTER_TOOL_DESC("browser", tool_browser,
 R"(browser(action, url?, selector?, text?, js?, limit?, timeout?, path?, full?):
 -controls a long-lived headless chromium through the local browser daemon (/tmp/browserd.sock, daemon: ~/browserd.py, launch: setsid nohup ~/browserd.py > /tmp/browserd.log 2>&1 &)
--actions: status, navigate(url), extract(selector?), links(limit?), click(selector), type(selector,text), eval(js), html, screenshot(path?,full?), back, forward, reset
+-actions: status, navigate(url), extract(selector?), links(limit?), click(selector), type(selector,text), eval(js), html, screenshot(path?,full?), back, forward, reset, frame(src,op,selector?,text?,key?)
 -one page, shared across calls; cookies persist via the profile dir; if the daemon is down the tool says how to start it
 -each call is one connection; the daemon exits after 600s idle - if it died, restart it and retry the failed action
 -for plain text search needs prefer web_search; use the browser for javascript-rendered pages, clicks, and session-sticky sites)");

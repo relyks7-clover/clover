@@ -44,7 +44,9 @@ class chat_backend{
             provider=p;
             build();
         }
-        string generate(const string& model, const json& context){
+        // one request attempt. returns content on 200 with a parsable
+        // body, or "" on any failure (all treated as retryable).
+        string attempt(const string& model, const json& context){
             json m; m["model"]=model;
             m["stream"]=false;
             m["messages"]=context;
@@ -66,6 +68,25 @@ class chat_backend{
             } else {
                 cerr<<"http error: failed to connect\n";
             }
+            return "";
+        }
+        // exponential backoff: a turn is never killed by one bad round.
+        // retries up to 5 attempts with 1,2,4,8s sleeps, rebuilding the ssl
+        // client each retry so a dead connection can't poison the loop.
+        string generate(const string& model, const json& context){
+            static constexpr int MAX_TRIES=5;
+            int backoff_ms=1000;
+            for (int t=0;t<MAX_TRIES;t++){
+                if (t>0){
+                    cerr<<"generate retry "<<t+1<<"/"<<MAX_TRIES<<" in "<<backoff_ms<<"ms\n";
+                    this_thread::sleep_for(chrono::milliseconds(backoff_ms));
+                    backoff_ms*=2;
+                    build();
+                }
+                string out=attempt(model, context);
+                if (!out.empty()) return out;
+            }
+            cerr<<"generate failed after "<<MAX_TRIES<<" attempts\n";
             return "";
         }
 };
