@@ -74,13 +74,13 @@ class chat_backend{
         // retries up to 5 attempts with 1,2,4,8s sleeps, rebuilding the ssl
         // client each retry so a dead connection can't poison the loop.
         string generate(const string& model, const json& context){
-            static constexpr int MAX_TRIES=5;
+            static constexpr int MAX_TRIES=10;
             int backoff_ms=1000;
             for (int t=0;t<MAX_TRIES;t++){
                 if (t>0){
                     cerr<<"generate retry "<<t+1<<"/"<<MAX_TRIES<<" in "<<backoff_ms<<"ms\n";
                     this_thread::sleep_for(chrono::milliseconds(backoff_ms));
-                    backoff_ms*=2;
+                    backoff_ms*=5; if (backoff_ms>60000) backoff_ms=60000;
                     build();
                 }
                 string out=attempt(model, context);

@@ -16,10 +16,21 @@ START     = time.time()
 B = None  # Browser instance, rebuilt on crash
 
 class Browser:
+    INIT_JS = """
+    Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+    Object.defineProperty(navigator, 'plugins', {get: () => [
+      {name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer'},
+      {name: 'Chrome PDF Viewer', filename: 'internal-pdf-viewer'},
+      {name: 'Chromium PDF Plugin', filename: 'internal-pdf-viewer'}]});
+    Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
+    window.chrome = window.chrome || {runtime: {}};
+    """
+
     def __init__(self):
         self.pw  = sync_playwright().start()
         self.ctx = self.pw.chromium.launch_persistent_context(
             PROFILE, headless=True)
+        self.ctx.add_init_script(self.INIT_JS)
         self.page = (self.ctx.pages[0] if self.ctx.pages
                      else self.ctx.new_page())
 
@@ -116,9 +127,9 @@ def handle(req):
         js = str(req.get("js", "")).strip()
         if not js:
             return {"ok": False, "error": "missing js"}
-        r = pg.evaluate("""(js) => {
+        r = pg.evaluate("""async (js) => {
             try {
-                const v = eval(js);
+                const v = await eval(js);
                 const s = JSON.stringify(v === undefined ? null : v);
                 return 'ok' + (s === undefined ? 'null' : s);
             } catch (e) { return 'err' + String(e); }
@@ -151,6 +162,42 @@ def handle(req):
     if act == "forward":
         pg.go_forward(timeout=to * 1000)
         return {"ok": True, "url": pg.url, "title": pg.title()}
+
+    if act == "frame":
+        src = str(req.get("src", "")).strip()
+        op = str(req.get("op", "")).strip()
+        if not src:
+            return {"ok": False, "error": "missing src (substring of iframe src)"}
+        if op not in ("click", "type", "extract", "list", "press"):
+            return {"ok": False, "error": "op must be click/type/extract/list/press"}
+        frames = [f for f in pg.frames if f is not pg.main_frame]
+        if op == "list":
+            return {"ok": True, "frames": [
+                {"url": f.url[:120], "name": f.name} for f in frames]}
+        tgt = None
+        for f in frames:
+            if src in f.url:
+                tgt = f
+                break
+        if tgt is None:
+            return {"ok": False, "error": "no iframe matching src=%r" % src,
+                    "available": [f.url[:100] for f in frames]}
+        sel = str(req.get("selector", "")).strip()
+        if op == "extract":
+            t = tgt.evaluate("document.body ? document.body.innerText : ''")
+            return {"ok": True, "text": t[:MAX_TEXT], "frame": tgt.url[:120]}
+        if not sel:
+            return {"ok": False, "error": "missing selector"}
+        if op == "click":
+            tgt.click(sel, timeout=to * 1000)
+            return {"ok": True}
+        if op == "press":
+            tgt.press(sel, str(req.get("key", "Enter")), timeout=to * 1000)
+            return {"ok": True}
+        if op == "type":
+            txt = req.get("text", "")
+            tgt.fill(sel, str(txt), timeout=to * 1000)
+            return {"ok": True}
 
     if act == "reset":
         pg.goto("about:blank")
@@ -199,9 +246,15 @@ def main():
                 try:
                     resp = handle(json.loads(line))
                 except PWError as e:
-                    reset_browser()
-                    resp = {"ok": False, "error": "browser error (reset), "
-                            "retry: %s" % str(e)[:250]}
+                    msg = str(e)[:250]
+                    fatal = ("Target closed" in msg or "Browser closed" in msg
+                             or "crashed" in msg or "Connection closed" in msg
+                             or "has been closed" in msg)
+                    if fatal:
+                        reset_browser()
+                        resp = {"ok": False, "error": "browser error (reset), retry: %s" % msg}
+                    else:
+                        resp = {"ok": False, "error": "transient: %s" % msg}
                 except Exception as e:
                     resp = {"ok": False, "error": "%s: %s"
                             % (type(e).__name__, str(e)[:250])}
