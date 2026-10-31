@@ -721,11 +721,9 @@ static std::string tool_browser(const json& args, tool_context&){
            "restart, close\n";
 }
 
-// registered alongside the legacy selector-based browser tool while this
-// one is proven; once verified live, the old python-daemon tool is removed
-// and this is renamed to browser.
-REGISTER_TOOL_DESC("browser2", tool_browser,
-R"(browser2(action, ...): native c++ browser automation (experimental, replaces browser)
+// the python-daemon browser tool is gone; this is THE browser tool.
+REGISTER_TOOL_DESC("browser", tool_browser,
+R"(browser(action, ...): native c++ browser automation (owns a headless chromium child, driven over raw cdp; no daemon, no second agent - the caller IS the agent loop)
 -owns a headless chromium child, driven over raw cdp; no daemon, no second agent - the caller IS the agent loop
 -actions: status, navigate(url), observe(), click(n), click_xy(x,y), type(n,text), press(key), hover(n), drag(from_n,to_n), drag_xy(x1,y1,x2,y2), scroll(dy), read(selector), eval(js), screenshot(path?,full?), restart, close
 -workflow: navigate, then observe -> numbered interactive elements (tag, id, class, text, value, position, size) + page text (capped 4000 chars). act by index n. indexes refer to the last observe; stale index errors mean observe again
