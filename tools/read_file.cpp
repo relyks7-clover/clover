@@ -41,6 +41,7 @@ static std::string tool_read_file(const nlohmann::json& args, tool_context&){
         }
     }
     std::string data(buf.begin(), buf.end());
+    if (data.empty()) return "(empty file)\n";
     long long lo=1, hi=0; // 1-based, inclusive; 0 = open-ended
     if (args.contains("lo") && args["lo"].is_number()) lo=args["lo"].get<long long>();
     if (args.contains("hi") && args["hi"].is_number()) hi=args["hi"].get<long long>();

@@ -71,8 +71,9 @@ class chat_backend{
             return "";
         }
         // exponential backoff: a turn is never killed by one bad round.
-        // retries up to 5 attempts with 1,2,4,8s sleeps, rebuilding the ssl
-        // client each retry so a dead connection can't poison the loop.
+        // 10 attempts, wait growing x5 (1s,5s,25s then capped at 60s),
+        // rebuilding the ssl client each retry so a dead keep-alive
+        // connection can't poison the loop.
         string generate(const string& model, const json& context){
             static constexpr int MAX_TRIES=10;
             int backoff_ms=1000;
@@ -110,15 +111,20 @@ class web_backend{
             m["contents"]={{"text",true}};
             m["freshness"]="noLimit";
             cerr<<"web search: "<<query<<'\n';
-            auto res=cli->Post("/v1/web-search", m.dump(), "application/json");
-            if (res && res->status==200){
-                try{ return json::parse(res->body).dump(); }
-                catch (const json::parse_error& e){ cerr<<"web search json parse error:\n"<<e.what()<<'\n'; }
-            } else if (res){
-                cerr<<"web search http error: status "<<res->status<<'\n';
-                cerr<<"body:\n"<<res->body<<'\n';
-            } else {
-                cerr<<"web search http error: failed to connect\n";
+            // 3 attempts with short doubling sleeps: web search is
+            // non-critical enrichment, so a light retry beats the chat
+            // path's heavy one.
+            for (int t=0;t<3;t++){
+                if (t>0) this_thread::sleep_for(chrono::milliseconds(1500<<t));
+                auto res=cli->Post("/v1/web-search", m.dump(), "application/json");
+                if (res && res->status==200){
+                    try{ return json::parse(res->body).dump(); }
+                    catch (const json::parse_error& e){ cerr<<"web search json parse error:\n"<<e.what()<<'\n'; }
+                } else if (res){
+                    cerr<<"web search http error: status "<<res->status<<'\n';
+                } else {
+                    cerr<<"web search http error: failed to connect\n";
+                }
             }
             return "";
         }
@@ -347,7 +353,7 @@ class agent{
             }
         }
         void clear_context(){
-            while (ctx.size()>1) ctx.erase(ctx.size()-1);
+            if (ctx.size()>1) ctx.erase(ctx.begin()+1, ctx.end());
             save_ctx();
         }
 
@@ -367,6 +373,8 @@ class agent{
                 }
             } catch (const exception& e){
                 result=string("tool dispatch error: ")+e.what()+"\n";
+            } catch (...){
+                result="tool dispatch error: unknown exception\n";
             }
             return result;
         }
@@ -385,8 +393,9 @@ class agent{
                 if (headerpos==string::npos){
                     return rsp;
                 }
-                // print any prose before the first tool header
-                cout<<rsp.substr(0, headerpos);
+                // print any prose before the first tool header (flushed so
+                // a pty parent sees progress mid-turn)
+                cout<<rsp.substr(0, headerpos)<<flush;
 
                 string toolres=toolrestag+"\n";
                 bool any=false;
@@ -400,7 +409,7 @@ class agent{
                     if (!arr){
                         cerr<<"malformed tool call: no json array after tool header\n";
                         toolres+="tool result, id: -1\n";
-                        toolres+=""; // placeholder line, replaced below
+                        toolres+="error: no json array found after the tool header; re-emit the header followed by a valid json array\n";
                         any=true;
                         cursor=after;
                         continue;

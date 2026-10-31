@@ -21,3 +21,6 @@ browser-profile/
 browserenv/
 .config/
 .local/
+# tool temp files on crash
+*.wr.tmp
+*.edit.tmp

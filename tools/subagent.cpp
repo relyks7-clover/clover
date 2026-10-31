@@ -64,6 +64,10 @@ static std::string tool_subagent(const nlohmann::json& args, tool_context&){
 
     pid_t pid=fork();
     if (pid<0) return "error: fork failed\n";
+    // double setpgid (parent here, child below): whichever lands first
+    // wins; closes the race where kill(-pid) fires before the child
+    // grouped itself and orphans the subtree.
+    setpgid(pid, pid);
     if (pid==0){
         // child: its own process group so a timeout kill reaps the subtree
         setpgid(0,0);
@@ -100,9 +104,16 @@ static std::string tool_subagent(const nlohmann::json& args, tool_context&){
     std::string body=oss.str();
     size_t nl=body.find('\n');
     if (nl!=std::string::npos && body.rfind("[", 0)==0) body=body.substr(nl+1);
-    if (timed_out)
+    if (timed_out){
         body="subagent timed out after "+std::to_string(max_seconds)+
              "s; partial output follows.\n"+body;
+        // the child's stderr says why it stalled (retries, tool errors):
+        // tail it into the report so the caller can act, capped hard.
+        std::ostringstream es; es<<std::ifstream(sdir+"/err").rdbuf();
+        std::string errtail=es.str();
+        if (errtail.size()>1200) errtail="..."+errtail.substr(errtail.size()-1200);
+        if (!errtail.empty()) body+="\n--- child stderr tail ---\n"+errtail;
+    }
     if (body.empty()) body="(subagent produced no output)\n";
     std::string rm="rm -rf "+sdir;
     int rc=system(rm.c_str());

@@ -313,10 +313,10 @@ static std::string resolve_n(int n, json& out){
         "for(var i=0;i<fr.length;i++){try{var r=fr[i].contentDocument&&" +
         "dig(fr[i].contentDocument);if(r)return r;}catch(e){}}return null;}" +
         "var el=dig(document);" +
-        "if(!el)return JSON.stringify({ok:0,e:'stale index: observe again'});" +
+        "if(!el)return {ok:0,e:'stale index: observe again'};" +
         "try{el.scrollIntoView({block:'center'});}catch(e){}" +
         "var r=el.getBoundingClientRect();" +
-        "return JSON.stringify({ok:1,tag:el.tagName.toLowerCase()," +
+        "return {ok:1,tag:el.tagName.toLowerCase()," +
         "text:(el.innerText||'').trim().slice(0,24)," +
         "x:+(r.left+r.width/2).toFixed(1),y:+(r.top+r.height/2).toFixed(1)," +
         "w:Math.round(r.width),h:Math.round(r.height)});})()";
@@ -324,9 +324,6 @@ static std::string resolve_n(int n, json& out){
     if (v.rfind("error", 0) == 0) return v;
     try { out = json::parse(v); }
     catch (...){ return "error: resolve parse failed\n"; }
-    // the js returns JSON.stringify(...) so eval_js hands back a
-    // double-encoded string: unwrap one level before use
-    if (out.is_string()) out = json::parse(out.get<std::string>());
     if (!out.value("ok", 0))
         return "error: " + out.value("e", "bad index") + "\n";
     return "";
@@ -345,7 +342,7 @@ static std::string status_json(json& out){
     std::string u = "", t = "";
     if (ST.ws && ST.ws->is_open()){
         std::string v = eval_js(
-            "JSON.stringify({u:location.href,t:document.title})", 10);
+            "({u:location.href,t:document.title})", 10);
         if (v.rfind("error", 0) != 0){
             try {
                 json j = json::parse(v);
@@ -428,16 +425,14 @@ static const char* OBSERVE_JS =
 "}"
 "walk(document);"
 "var text=document.body?document.body.innerText:'';"
-"return JSON.stringify({url:location.href,title:document.title,count:n,"
-"  elements:out,text:text.slice(0,4000),textlen:text.length});"
+"return {url:location.href,title:document.title,count:n,"
+"  elements:out,text:text.slice(0,4000),textlen:text.length};"
 "})()";
 
 static std::string render_observe(const std::string& raw){
     json j;
     try { j = json::parse(raw); }
     catch (...){ return "error: observe result did not parse\n"; }
-    // OBSERVE_JS returns JSON.stringify(...): unwrap the extra layer
-    if (j.is_string()) j = json::parse(j.get<std::string>());
     std::string out;
     out += "url: " + j.value("url", "") + "\n";
     out += "title: " + j.value("title", "") + "\n";
@@ -668,7 +663,7 @@ static std::string tool_browser(const json& args, tool_context&){
     if (action == "scroll"){
         int dy = args.value("dy", 300);
         std::string js = "window.scrollBy(0," + std::to_string(dy) +
-            ");JSON.stringify({y:window.scrollY,h:document.body.scrollHeight})";
+            ");({y:window.scrollY,h:document.body.scrollHeight})";
         std::string v = eval_js(js);
         if (v.rfind("error", 0) == 0) return v;
         return "scrolled " + std::to_string(dy) + ": " + v + "\n";
