@@ -130,6 +130,76 @@ class web_backend{
         }
 };
 
+// base64 for embedding screenshots as data-url image blocks in tool
+// result messages (vision-capable models read them; others ignore or the
+// provider errors, so attach only when the model is on the vision list).
+static string b64_enc(const string& in){
+    static const char* T="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    string out;
+    out.reserve((in.size()+2)/3*4);
+    size_t i=0;
+    while (i+2<in.size()){ 
+        uint32_t v=(uint8_t)in[i]<<16|(uint8_t)in[i+1]<<8|(uint8_t)in[i+2];
+        out+=T[v>>18&63]; out+=T[v>>12&63]; out+=T[v>>6&63]; out+=T[v&63];
+        i+=3;
+    }
+    size_t rem=in.size()-i;
+    if (rem==1){
+        uint32_t v=(uint8_t)in[i]<<16;
+        out+=T[v>>18&63]; out+=T[v>>12&63]; out+="==";
+    } else if (rem==2){
+        uint32_t v=(uint8_t)in[i]<<16|(uint8_t)in[i+1]<<8;
+        out+=T[v>>18&63]; out+=T[v>>12&63]; out+=T[v>>6&63]; out+='=';
+    }
+    return out;
+}
+
+// loads a file wholly. returns empty on failure.
+static string slurp_file(const string& path){
+    ifstream f(path, ios::binary);
+    if (!f) return "";
+    ostringstream ss; ss<<f.rdbuf();
+    return ss.str();
+}
+
+// extract screenshot png paths from a tool-results text block. attaches the
+// images as openai-style image_url blocks. when the model is not vision-
+// capable the text stays a plain string (providers reject mixed content for
+// text-only models). returns the final message json.
+static json attach_images(const string& text, const string& model){
+    static const vector<string> vision={"deepseek-v4.1-flash-1017","glm-5.3-flash","gemma-4-26b","qwen-3.8-27b","obi2"};
+    bool vic=false;
+    for (auto& v:vision) if (model==v){ vic=true; break; }
+    json out;
+    if (!vic) return text;
+    vector<string> paths;
+    size_t pos=0;
+    while (true){
+        size_t hit=text.find("screenshot saved: ", pos);
+        if (hit==string::npos) break;
+        size_t s=hit+18;
+        size_t e=text.find(' ', s);
+        if (e==string::npos) e=text.size();
+        string p=text.substr(s, e-s);
+        if (p.size()>4 && p.substr(p.size()-4)==".png") paths.push_back(p);
+        pos=e;
+    }
+    if (paths.empty()) return text;
+    json content=json::array();
+    content.push_back({{"type","text"},{"text",text}});
+    int attached=0;
+    for (auto& p:paths){
+        if (attached>=3) break;
+        string png=slurp_file(p);
+        if (png.empty()) continue;
+        if (png.size()>3*1024*1024) continue; // cap 3MB per image
+        content.push_back({{"type","image_url"},{"image_url",{{"url","data:image/png;base64,"+b64_enc(png)}}}});
+        attached++;
+    }
+    if (attached==0) return text;
+    return content;
+}
+
 // returns content of first balanced [] starting at or after pos, advancing
 // `end` to just past the closing bracket. returns nullopt if none.
 static optional<string> extract_array(const string& s, size_t start, size_t& end){
@@ -452,12 +522,12 @@ class agent{
                     // header with nothing runnable beneath it: tell the model,
                     // let it retry instead of dumping raw tool text at the user
                     toolres+="error: [TOOL] header with no tool array after it; fix and re-emit\n";
-                    ctx.push_back({{"role", "user"}, {"content", toolres}});
+                    ctx.push_back({{"role", "user"}, {"content", attach_images(toolres, model)}});
                     ctx.push_back({{"role", "user"}, {"content", toolcontinue}});
                     save_ctx();
                     continue;
                 }
-                ctx.push_back({{"role", "user"}, {"content", toolres}});
+                ctx.push_back({{"role", "user"}, {"content", attach_images(toolres, model)}});
                 ctx.push_back({{"role", "user"}, {"content", toolcontinue}});
                 save_ctx();
             }

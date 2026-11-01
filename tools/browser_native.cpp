@@ -759,6 +759,7 @@ REGISTER_TOOL_DESC("browser", tool_browser,
 R"(browser(action, ...): native c++ browser automation (owns a headless chromium child, driven over raw cdp; no daemon, no second agent - the caller IS the agent loop)
 -owns a headless chromium child, driven over raw cdp; no daemon, no second agent - the caller IS the agent loop
 -actions: status, navigate(url), observe(), click(n), click_xy(x,y), type(n,text), press(key), hover(n), drag(from_n,to_n), drag_xy(x1,y1,x2,y2), scroll(dy), read(selector), eval(js), screenshot(path?,full?), restart, close
+-screenshots: screenshot(path?) saves a png AND attaches it to the model as a real image (vision-capable models only); use it to actually SEE the page: grids, images, games, anything visual. prefer screenshot for visual tasks over pixel-stat evals.
 -workflow: navigate, then observe -> numbered interactive elements (tag, id, class, text, value, position, size) + page text (capped 4000 chars). act by index n. indexes refer to the last observe; stale index errors mean observe again
 -svg shapes and cursor:pointer elements are numbered with geometry; for computed positions (pie wedges, canvas) use click_xy/drag_xy with coordinates derived from observed geometry
 -same-origin iframes walked automatically; cookies persist in the profile dir; chromium lazily starts on first call, idles out after 900s (relaunch transparent)
