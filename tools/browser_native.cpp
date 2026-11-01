@@ -120,6 +120,24 @@ static void teardown(){
 
 static std::string launch(){
     teardown();
+    // headed-under-xvfb mode: if Xvfb exists and CLOVER_HEADLESS is not "1",
+    // run a real (non-headless) chrome under a virtual display. bot walls
+    // fingerprint headless chromium hard; a headed instance under xvfb
+    // behaves like a desktop browser to the page.
+    static int xvfb_mode = -1;
+    if (xvfb_mode < 0){
+        const char* env = getenv("CLOVER_HEADLESS");
+        xvfb_mode = (env && strcmp(env, "1") == 0) ? 0 : 1;
+        if (xvfb_mode){
+            if (access("/usr/bin/Xvfb", X_OK) != 0) xvfb_mode = 0;
+        }
+    }
+    if (xvfb_mode){
+        // ensure the virtual display is up before chrome needs it
+        if (system("pgrep -x Xvfb >/dev/null 2>&1 || "
+                    "(setsid nohup Xvfb :99 -screen 0 1280x800x24 "
+                    " >/dev/null 2>&1 & sleep 1)") != 0){}
+    }
     std::string chrome = find_chrome();
     if (chrome.empty())
         return "error: no chromium binary found\n";
@@ -132,8 +150,10 @@ static std::string launch(){
         "--remote-debugging-port=" + pstr,
         std::string("--user-data-dir=") + PROFILE_DIR,
         "--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage",
-        "--headless=new", "--no-first-run", "--no-default-browser-check",
+        "--enable-unsafe-swiftshader",
+        "--no-first-run", "--no-default-browser-check",
         "--hide-scrollbars", "--remote-allow-origins=*",
+        "--disable-blink-features=AutomationControlled",
         "--window-size=1280,800", "about:blank" };
     std::vector<char*> argv;
     for (auto& s : argstr) argv.push_back(const_cast<char*>(s.c_str()));
@@ -144,6 +164,7 @@ static std::string launch(){
     if (pid == 0){
         setsid();
         prctl(PR_SET_PDEATHSIG, SIGKILL);
+        if (xvfb_mode) setenv("DISPLAY", ":99", 1);
         if (devnull >= 0){ dup2(devnull, 1); dup2(devnull, 2); }
         execv(argv[0], argv.data());
         _exit(127);
@@ -195,6 +216,23 @@ static std::string launch(){
     ST.port = port;
     ST.started = time(nullptr);
     ST.seen_load = false;
+    // stealth init script: runs before every page script. hides the
+    // headless/webdriver tells that bot-walls fingerprint (same script the
+    // old python daemon used, ported to cdp).
+    static const char* STEALTH_JS =
+        "Object.defineProperty(navigator,'webdriver',"
+        "{get:()=>undefined});"
+        "window.chrome=window.chrome||{runtime:{}};"
+        "(()=>{const ua=navigator.userAgent;"
+        "if(ua&&ua.indexOf('HeadlessChrome')>=0)"
+        "Object.defineProperty(navigator,'userAgent',"
+        "{get:()=>ua.replace('HeadlessChrome','Chrome')});})();";
+    {
+        json r2;
+        std::string e;
+        if (!(e = cdp("Page.addScriptToEvaluateOnNewDocument",
+                      {{"source", STEALTH_JS}}, r2, 10)).empty()) return e;
+    }
     json r;
     std::string e;
     if (!(e = cdp("Page.enable", json::object(), r, 10)).empty()) return e;
