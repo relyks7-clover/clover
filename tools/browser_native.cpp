@@ -551,6 +551,7 @@ static std::string tool_browser(const json& args, tool_context&){
         err = resolve_n(n, el);
         if (!err.empty()) return err;
         double x = el.value("x", 0.0), y = el.value("y", 0.0);
+        if (!(err = mouse_event("mouseMoved", x, y, 0, 0)).empty()) return err;
         if (!(err = mouse_event("mousePressed", x, y, 1, 1)).empty()) return err;
         if (!(err = mouse_event("mouseReleased", x, y, 0, 1)).empty()) return err;
         usleep(150000);
@@ -561,6 +562,7 @@ static std::string tool_browser(const json& args, tool_context&){
 
     if (action == "click_xy"){
         double x = args.value("x", 0.0), y = args.value("y", 0.0);
+        if (!(err = mouse_event("mouseMoved", x, y, 0, 0)).empty()) return err;
         if (!(err = mouse_event("mousePressed", x, y, 1, 1)).empty()) return err;
         if (!(err = mouse_event("mouseReleased", x, y, 0, 1)).empty()) return err;
         usleep(150000);
@@ -576,6 +578,8 @@ static std::string tool_browser(const json& args, tool_context&){
         json el;
         err = resolve_n(n, el);
         if (!err.empty()) return err;
+        if (!(err = mouse_event("mouseMoved", el.value("x", 0.0),
+                                el.value("y", 0.0), 0, 0)).empty()) return err;
         if (!(err = mouse_event("mousePressed", el.value("x", 0.0),
                                 el.value("y", 0.0), 1, 1)).empty()) return err;
         if (!(err = mouse_event("mouseReleased", el.value("x", 0.0),
@@ -601,6 +605,15 @@ static std::string tool_browser(const json& args, tool_context&){
             try { nowv = json::parse(nowv).get<std::string>(); } catch (...) {}
         return "typed into [" + std::to_string(n) + "] " + el.value("tag", "") +
                ". now: " + nowv + "\n";
+    }
+
+    if (action == "type_text"){
+        std::string text = args.value("text", "");
+        if (text.empty()) return "error: type_text needs text\n";
+        json res;
+        err = cdp("Input.insertText", {{"text", text}}, res, 10);
+        if (!err.empty()) return err;
+        return "inserted " + std::to_string(text.size()) + " chars\n";
     }
 
     if (action == "press"){
