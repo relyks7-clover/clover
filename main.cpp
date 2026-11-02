@@ -14,9 +14,9 @@ static const string toolcontinue="<continue>";
 static const string toolrestag="[tool results]";
 
 struct config{
-    string provider="openrouter.ai";
+    string provider="logfare.ai";
     string web_provider="api.langsearch.com";
-    string model="openrouter/free";
+    string model="glm-5.3";
     string promptfile="sysprompts/clover.txt";
     string chat_key=getenv("CLOVER_CHAT_KEY")?getenv("CLOVER_CHAT_KEY"):"";
     string or_key=getenv("CLOVER_OR_KEY")?getenv("CLOVER_OR_KEY"):"";
