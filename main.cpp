@@ -27,6 +27,25 @@ struct config{
     static string or_key_for(){ return getenv("CLOVER_OR_KEY")?getenv("CLOVER_OR_KEY"):""; }
 };
 
+// set when the provider hard-rejects image parts; attach_images stops
+// attaching for the rest of the process once this flips.
+static bool g_vision_denied=false;
+
+// copy of the context with image parts removed: array content collapses
+// to its concatenated text. used when a provider 400s on images.
+static json strip_images(const json& ctx){
+    json out=ctx;
+    if (!out.is_array()) return out;
+    for (auto& m:out){
+        if (!m.contains("content") || !m["content"].is_array()) continue;
+        string txt;
+        for (auto& part:m["content"])
+            if (part.value("type","")=="text") txt+=part["text"].get<string>();
+        m["content"]=txt;
+    }
+    return out;
+}
+
 // lazily (re)builds ssl clients when provider/key changes, since SSLClient is
 // final and non-movable, so we cannot just reassign it.
 class chat_backend{
@@ -52,8 +71,12 @@ class chat_backend{
             build();
         }
         // one request attempt. returns content on 200 with a parsable
-        // body, or "" on any failure (all treated as retryable).
-        string attempt(const string& model, const json& context){
+        // body. err is cleared on success, otherwise set to one of:
+        //   "retry"   - transient (429/5xx/connect/parse), retry with backoff
+        //   "novision"- provider 400 rejecting image parts; strip images, retry
+        //   "fatal"   - other 4xx; retrying is pointless, fail fast
+        string attempt(const string& model, const json& context, string& err){
+            err.clear();
             json m; m["model"]=model;
             m["stream"]=false;
             m["messages"]=context;
@@ -64,27 +87,38 @@ class chat_backend{
                 try{
                     auto resp_json=json::parse(res->body);
                     if (!resp_json.contains("choices") || resp_json["choices"].empty())
-                        { cerr<<"unexpected response shape\n"; return ""; }
+                        { cerr<<"unexpected response shape\n"; err="retry"; return ""; }
                     return resp_json["choices"][0]["message"]["content"].get<string>();
                 } catch (const json::parse_error& e){
-                    cerr<<"response json parse error:\n"<<e.what()<<'\n';
+                    cerr<<"response json parse error:\n"<<e.what()<<'\n'; err="retry";
                 } catch (const json::type_error& e){
-                    cerr<<"response json type error:\n"<<e.what()<<'\n';
+                    cerr<<"response json type error:\n"<<e.what()<<'\n'; err="retry";
                 }
-            } else if (res){
-                cerr<<"http error: status "<<res->status<<'\n';
-                cerr<<"body:\n"<<res->body<<'\n';
-            } else {
-                cerr<<"http error: failed to connect\n";
+                return "";
             }
-            return "";
+            string body = res ? res->body : "";
+            int st = res ? res->status : 0;
+            if (!res){
+                cerr<<"http error: failed to connect\n"; err="retry"; return "";
+            }
+            cerr<<"http error: status "<<st<<"\nbody:\n"<<body<<'\n';
+            if (st==400){
+                string b=body; transform(b.begin(),b.end(),b.begin(),::tolower);
+                if (b.find("multimodal")!=string::npos || b.find("image")!=string::npos){
+                    err="novision"; return "";
+                }
+                err="fatal"; return "";
+            }
+            err="retry"; return "";
         }
-        // exponential backoff: a turn is never killed by one bad round.
-        // 10 attempts, wait growing x5 (1s,5s,25s then capped at 60s),
-        // rebuilding the ssl client each retry so a dead keep-alive
-        // connection can't poison the loop.
+        // exponential backoff with error classification: transient errors
+        // retry with growing waits, image-rejections strip images once and
+        // continue, other 4xx abort immediately (retrying a permanent error
+        // just burns the budget).
         string generate(const string& model, const json& context){
             static constexpr int MAX_TRIES=10;
+            json ctx=context;
+            bool stripped=false;
             int backoff_ms=1000;
             for (int t=0;t<MAX_TRIES;t++){
                 if (t>0){
@@ -93,8 +127,22 @@ class chat_backend{
                     backoff_ms*=5; if (backoff_ms>60000) backoff_ms=60000;
                     build();
                 }
-                string out=attempt(model, context);
+                string err;
+                string out=attempt(model, ctx, err);
                 if (!out.empty()) return out;
+                if (err=="novision" && !stripped){
+                    cerr<<"provider rejected image parts; stripping images and retrying\n";
+                    g_vision_denied=true;
+                    ctx=strip_images(ctx);
+                    stripped=true;
+                    // immediate retry, no backoff
+                    out=attempt(model, ctx, err);
+                    if (!out.empty()) return out;
+                }
+                if (err=="fatal"){
+                    cerr<<"generate failed: permanent provider error, not retrying\n";
+                    return "";
+                }
             }
             cerr<<"generate failed after "<<MAX_TRIES<<" attempts\n";
             return "";
@@ -176,7 +224,8 @@ static string slurp_file(const string& path){
 // capable the text stays a plain string (providers reject mixed content for
 // text-only models). returns the final message json.
 static json attach_images(const string& text, const string& model){
-    static const vector<string> vision={"deepseek-v4.1-flash-1017","glm-5.3-flash","gemma-4-26b","qwen-3.8-27b","obi2"};
+    static const vector<string> vision={"deepseek-v4.1-flash-1017","glm-5.3","glm-5.3-flash","gemma-4-26b","qwen-3.8-27b","obi2"};
+    if (g_vision_denied) return text;
     bool vic=false;
     for (auto& v:vision) if (model==v){ vic=true; break; }
     json out;
