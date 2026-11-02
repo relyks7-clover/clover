@@ -14,14 +14,17 @@ static const string toolcontinue="<continue>";
 static const string toolrestag="[tool results]";
 
 struct config{
-    string provider="logfare.ai";
+    string provider="openrouter.ai";
     string web_provider="api.langsearch.com";
-    string model="glm-5.3";
+    string model="openrouter/free";
     string promptfile="sysprompts/clover.txt";
     string chat_key=getenv("CLOVER_CHAT_KEY")?getenv("CLOVER_CHAT_KEY"):"";
+    string or_key=getenv("CLOVER_OR_KEY")?getenv("CLOVER_OR_KEY"):"";
     string web_key=getenv("CLOVER_WEB_KEY")?getenv("CLOVER_WEB_KEY"):"";
     string ctxfile="context.json";
     string purpose;
+    static string chat_key_for(){ return getenv("CLOVER_CHAT_KEY")?getenv("CLOVER_CHAT_KEY"):""; }
+    static string or_key_for(){ return getenv("CLOVER_OR_KEY")?getenv("CLOVER_OR_KEY"):""; }
 };
 
 // lazily (re)builds ssl clients when provider/key changes, since SSLClient is
@@ -31,7 +34,7 @@ class chat_backend{
         string provider;
         string key;
         unique_ptr<httplib::SSLClient> cli;
-        chat_backend(const config& c):provider(c.provider), key(c.chat_key){ build(); }
+        chat_backend(const config& c):provider(c.provider), key(c.provider=="openrouter.ai"?config::or_key_for():config::chat_key_for()){ build(); }
         void build(){
             cli=make_unique<httplib::SSLClient>(provider);
             cli->set_keep_alive(false);
@@ -42,6 +45,10 @@ class chat_backend{
         void set_provider(const string& p){
             if (p==provider) return;
             provider=p;
+            // providers are keyed by their own env var: openrouter uses
+            // CLOVER_OR_KEY, everything else stays on CLOVER_CHAT_KEY.
+            if (provider=="openrouter.ai") key=config::or_key_for();
+            else key=config::chat_key_for();
             build();
         }
         // one request attempt. returns content on 200 with a parsable
@@ -50,7 +57,9 @@ class chat_backend{
             json m; m["model"]=model;
             m["stream"]=false;
             m["messages"]=context;
-            auto res=cli->Post("/v1/chat/completions", m.dump(), "application/json");
+            // openrouter exposes its api under /api/v1, everyone else /v1
+            string path = (provider=="openrouter.ai") ? "/api/v1/chat/completions" : "/v1/chat/completions";
+            auto res=cli->Post(path.c_str(), m.dump(), "application/json");
             if (res && res->status==200){
                 try{
                     auto resp_json=json::parse(res->body);
