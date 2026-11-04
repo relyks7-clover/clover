@@ -552,8 +552,15 @@ class agent{
         }
         // trim in memory right before the request is sent: the file is only
         // written on save, so an in-memory ctx could grow unchecked between
-        // turns and blow the provider's request size.
-        void compact(){ ctx=trim_context_bytes(ctx, CTX_MAX_BYTES); }
+        // turns and blow the provider's request size. old images are dropped
+        // first: they are the densest bytes in the transcript and a stale
+        // screenshot is worth less than the exchanges it would evict.
+        void compact(){
+            if (ctx.dump().size()<=CTX_MAX_BYTES) return;
+            json lean=strip_images(ctx);
+            if (lean.dump().size()<=CTX_MAX_BYTES){ ctx=lean; return; }
+            ctx=trim_context_bytes(lean, CTX_MAX_BYTES);
+        }
         agent(const string& modelname, const string& sysprompt, const string& agentname,
               chat_backend& ch, web_backend& wb)
             :model(modelname), sys_tpl(sysprompt), name(agentname), chat(ch), web(wb){
