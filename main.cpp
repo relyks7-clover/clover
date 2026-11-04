@@ -16,7 +16,7 @@ static const string toolrestag="[tool results]";
 struct config{
     string provider="logfare.ai";
     string web_provider="api.langsearch.com";
-    string model="glm-5.3";
+    string model="deepseek-v4.1-flash-1017";
     string promptfile="sysprompts/clover.txt";
     string chat_key=getenv("CLOVER_CHAT_KEY")?getenv("CLOVER_CHAT_KEY"):"";
     string or_key=getenv("CLOVER_OR_KEY")?getenv("CLOVER_OR_KEY"):"";
@@ -30,6 +30,11 @@ struct config{
 // set when the provider hard-rejects image parts; attach_images stops
 // attaching for the rest of the process once this flips.
 static bool g_vision_denied=false;
+
+// declared early: chat_backend's retry loop shrinks oversized requests.
+static constexpr size_t CTX_MAX_BYTES = 1500000;
+static json trim_context_bytes(const json& messages, size_t max_bytes);
+static bool has_image(const json& messages);
 
 // copy of the context with image parts removed: array content collapses
 // to its concatenated text. used when a provider 400s on images.
@@ -48,14 +53,21 @@ static json strip_images(const json& ctx){
 
 // lazily (re)builds ssl clients when provider/key changes, since SSLClient is
 // final and non-movable, so we cannot just reassign it.
+// tests drive the backends against a plain-http stub; production is always tls.
+#ifdef CLOVER_PLAIN_HTTP
+using clover_client = httplib::Client;
+#else
+using clover_client = httplib::SSLClient;
+#endif
+
 class chat_backend{
     public:
         string provider;
         string key;
-        unique_ptr<httplib::SSLClient> cli;
+        unique_ptr<clover_client> cli;
         chat_backend(const config& c):provider(c.provider), key(c.provider=="openrouter.ai"?config::or_key_for():config::chat_key_for()){ build(); }
         void build(){
-            cli=make_unique<httplib::SSLClient>(provider);
+            cli=make_unique<clover_client>(provider);
             cli->set_keep_alive(false);
             cli->set_connection_timeout(0,3000000);
             cli->set_read_timeout(300,0);
@@ -102,10 +114,19 @@ class chat_backend{
                 cerr<<"http error: failed to connect\n"; err="retry"; return "";
             }
             cerr<<"http error: status "<<st<<"\nbody:\n"<<body<<'\n';
+            if (st==413){
+                // request too large: not a transient failure. signal the caller
+                // to shrink the payload (drop images, then hard-compact).
+                err="toolarge"; return "";
+            }
             if (st==400){
                 string b=body; transform(b.begin(),b.end(),b.begin(),::tolower);
                 if (b.find("multimodal")!=string::npos || b.find("image")!=string::npos){
                     err="novision"; return "";
+                }
+                if (b.find("too large")!=string::npos || b.find("maximum context")!=string::npos ||
+                    b.find("context length")!=string::npos || b.find("token")!=string::npos){
+                    err="toolarge"; return "";
                 }
                 err="fatal"; return "";
             }
@@ -120,8 +141,9 @@ class chat_backend{
             json ctx=context;
             bool stripped=false;
             int backoff_ms=1000;
+            int shrink=0;
             for (int t=0;t<MAX_TRIES;t++){
-                if (t>0){
+                if (t>0 && shrink==0){
                     cerr<<"generate retry "<<t+1<<"/"<<MAX_TRIES<<" in "<<backoff_ms<<"ms\n";
                     this_thread::sleep_for(chrono::milliseconds(backoff_ms));
                     backoff_ms*=5; if (backoff_ms>60000) backoff_ms=60000;
@@ -130,14 +152,36 @@ class chat_backend{
                 string err;
                 string out=attempt(model, ctx, err);
                 if (!out.empty()) return out;
-                if (err=="novision" && !stripped){
-                    cerr<<"provider rejected image parts; stripping images and retrying\n";
-                    g_vision_denied=true;
+                if ((err=="novision" || err=="toolarge") && !stripped && has_image(ctx)){
+                    cerr<<"dropping image parts and retrying\n";
+                    if (err=="novision") g_vision_denied=true;
                     ctx=strip_images(ctx);
                     stripped=true;
-                    // immediate retry, no backoff
                     out=attempt(model, ctx, err);
                     if (!out.empty()) return out;
+                }
+                if (err=="toolarge"){
+                    // the provider's true limit is unknown: halve the CURRENT
+                    // payload, not a fixed constant, so a small-but-rejected
+                    // request still loses half its history each round.
+                    size_t before=ctx.dump().size();
+                    size_t target=before/2;
+                    if (target<4000) target=4000;
+                    shrink++;
+                    ctx=trim_context_bytes(ctx, target);
+                    size_t after=ctx.dump().size();
+                    cerr<<"context too large; compacted "<<before<<" -> "<<after<<" bytes\n";
+                    if (after>=before){
+                        // nothing left to drop: the request itself is the floor
+                        cerr<<"cannot shrink context any further ("<<after<<" bytes)\n";
+                        return "";
+                    }
+                    if (shrink>16){
+                        cerr<<"context still too large after "<<shrink<<" compactions\n";
+                        return "";
+                    }
+                    t--;  // shrinking is not a retry: do not consume the budget
+                    continue;
                 }
                 if (err=="fatal"){
                     cerr<<"generate failed: permanent provider error, not retrying\n";
@@ -153,10 +197,10 @@ class web_backend{
     public:
         string provider;
         string key;
-        unique_ptr<httplib::SSLClient> cli;
+        unique_ptr<clover_client> cli;
         web_backend(const config& c):provider(c.web_provider), key(c.web_key){ build(); }
         void build(){
-            cli=make_unique<httplib::SSLClient>(provider);
+            cli=make_unique<clover_client>(provider);
             cli->set_keep_alive(false);
             cli->set_connection_timeout(0,3000000);
             cli->set_read_timeout(300,0);
@@ -219,12 +263,33 @@ static string slurp_file(const string& path){
     return ss.str();
 }
 
+// models that accept image_url content parts.
+static const vector<string> vision_models={"deepseek-v4.1-flash-1017","glm-5.3","glm-5.3-flash","gemma-4-26b","qwen-3.8-27b","obi2"};
+static bool model_is_vision(const string& model){
+    for (auto& v:vision_models) if (model==v) return true;
+    return false;
+}
+
+// true when any message carries a structured (image) content array. images
+// are never required: a text-only model just gets the text half.
+static bool has_image(const json& messages){
+    if (!messages.is_array()) return false;
+    for (auto& m: messages){
+        if (!m.is_object() || !m.contains("content")) continue;
+        if (m["content"].is_array()){
+            for (auto& part: m["content"])
+                if (part.is_object() && part.value("type","")=="image_url") return true;
+        }
+    }
+    return false;
+}
+
 // extract screenshot png paths from a tool-results text block. attaches the
 // images as openai-style image_url blocks. when the model is not vision-
 // capable the text stays a plain string (providers reject mixed content for
 // text-only models). returns the final message json.
 static json attach_images(const string& text, const string& model){
-    static const vector<string> vision={"deepseek-v4.1-flash-1017","glm-5.3","glm-5.3-flash","gemma-4-26b","qwen-3.8-27b","obi2"};
+    static const vector<string> vision=vision_models;
     if (g_vision_denied) return text;
     bool vic=false;
     for (auto& v:vision) if (model==v){ vic=true; break; }
@@ -315,6 +380,43 @@ static json trim_context(const json& messages){
             }
         } else if (role=="user" && content=="<continue>"){
             start--;
+        }
+    }
+    json out=json::array();
+    for (size_t i=0;i<first;i++) out.push_back(messages[i]);
+    for (size_t i=start;i<messages.size();i++) out.push_back(messages[i]);
+    return out;
+}
+
+// byte-based budget. message-count trimming alone is not enough: a single
+// screenshot can be a few hundred KB, so 300 messages easily exceed the
+// provider's request size and surface as a 413. drops whole tool exchanges
+// from the oldest end until the serialized context fits. system untouched.
+static json trim_context_bytes(const json& messages, size_t max_bytes){
+    if (!messages.is_array()) return messages;
+    size_t first=0;
+    while (first<messages.size() && messages[first].value("role","")=="system") first++;
+    size_t start=first;
+    auto size_at=[&](size_t s){
+        size_t n=0;
+        for (size_t i=0;i<first;i++) n+=messages[i].dump().size();
+        for (size_t i=s;i<messages.size();i++) n+=messages[i].dump().size();
+        return n;
+    };
+    while (start<messages.size() && size_at(start)>max_bytes){
+        // drop one whole unit from the oldest end: a tool exchange is
+        // [assistant?] + [tool results] + <continue>, never split.
+        string role=messages[start].value("role","");
+        string content;
+        if (messages[start].contains("content") && messages[start]["content"].is_string())
+            content=messages[start]["content"].get<string>();
+        start++;
+        if (role=="user" && content.rfind("[tool results]",0)==0 && start<messages.size()){
+            string r2=messages[start].value("role","");
+            string c2;
+            if (messages[start].contains("content") && messages[start]["content"].is_string())
+                c2=messages[start]["content"].get<string>();
+            if (r2=="user" && c2=="<continue>") start++;
         }
     }
     json out=json::array();
@@ -445,8 +547,13 @@ class agent{
         context_store* store=nullptr;
         int max_tool_rounds=250;
         void save_ctx(){
+            ctx=trim_context_bytes(ctx, CTX_MAX_BYTES);
             if (store) store->save(ctx, model, chat.provider);
         }
+        // trim in memory right before the request is sent: the file is only
+        // written on save, so an in-memory ctx could grow unchecked between
+        // turns and blow the provider's request size.
+        void compact(){ ctx=trim_context_bytes(ctx, CTX_MAX_BYTES); }
         agent(const string& modelname, const string& sysprompt, const string& agentname,
               chat_backend& ch, web_backend& wb)
             :model(modelname), sys_tpl(sysprompt), name(agentname), chat(ch), web(wb){
@@ -513,7 +620,16 @@ class agent{
             ctx.push_back({{"role", "user"}, {"content", msg}});
             save_ctx();
             for (int round=0; round<max_tool_rounds; round++){
-                string rsp=chat.generate(model, ctx);
+                compact();
+                // a screenshot makes the payload multimodal. if the active model
+                // cannot take images, borrow a vision model for this request and
+                // switch straight back: the transcript keeps our identity/model.
+                string sendmodel=model;
+                if (has_image(ctx) && !model_is_vision(model) && !g_vision_denied){
+                    sendmodel="deepseek-v4.1-flash-1017";
+                    cerr<<"image in context; using "<<sendmodel<<" for this request\n";
+                }
+                string rsp=chat.generate(sendmodel, ctx);
                 ctx.push_back({{"role", "assistant"}, {"content", rsp}});
                 save_ctx();
 
