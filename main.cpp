@@ -133,6 +133,7 @@ struct config{
     static string chat_key_for(){ return getenv("CLOVER_CHAT_KEY")?getenv("CLOVER_CHAT_KEY"):""; }
     static string or_key_for(){ return getenv("CLOVER_OR_KEY")?getenv("CLOVER_OR_KEY"):""; }
     static string gm_key_for(){ return getenv("CLOVER_GM_KEY")?getenv("CLOVER_GM_KEY"):""; }
+    static string zk_key_for(){ return getenv("CLOVER_ZK_KEY")?getenv("CLOVER_ZK_KEY"):""; }
 };
 
 // set when the provider hard-rejects image parts; attach_images stops
@@ -179,6 +180,7 @@ class chat_backend{
         static string key_for_provider(const string& p){
             if (p=="openrouter.ai") return config::or_key_for();
             if (p=="generativelanguage.googleapis.com") return config::gm_key_for();
+            if (p=="scandata-relay.zarnkina.workers.dev") return config::zk_key_for();
             return config::chat_key_for();
         }
         static string path_for_provider(const string& p){
@@ -1055,7 +1057,7 @@ int main(int argc, char** argv){
     string active_chat_key = chat_backend::key_for_provider(cfg.provider);
     if (active_chat_key.empty() || cfg.web_key.empty()){
         cerr<<"error: no chat key for provider "<<cfg.provider
-            <<" (set CLOVER_CHAT_KEY / CLOVER_OR_KEY / CLOVER_GM_KEY) and CLOVER_WEB_KEY"<<'\n';
+            <<" (set CLOVER_CHAT_KEY / CLOVER_OR_KEY / CLOVER_GM_KEY / CLOVER_ZK_KEY) and CLOVER_WEB_KEY"<<'\n';
         return 1;
     }
     chat_backend chat(cfg);
