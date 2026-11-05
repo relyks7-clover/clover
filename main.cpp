@@ -14,9 +14,9 @@ static const string toolcontinue="<continue>";
 static const string toolrestag="[tool results]";
 
 struct config{
-    string provider="generativelanguage.googleapis.com";
+    string provider="logfare.ai";
     string web_provider="api.langsearch.com";
-    string model="gemini-3.8-flash";
+    string model="qwen-3.8-27b";
     string promptfile="sysprompts/clover.txt";
     string web_key=getenv("CLOVER_WEB_KEY")?getenv("CLOVER_WEB_KEY"):"";
     string ctxfile="context.json";
