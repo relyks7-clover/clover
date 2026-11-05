@@ -18,8 +18,8 @@ static const string toolrestag="[tool results]";
 // scripts) gets byte-identical output to the pre-ui build.
 static int g_ui_tty=-1;
 static bool ui_on(){ if (g_ui_tty<0) g_ui_tty=isatty(1); return g_ui_tty; }
-static const string C_RESET="\x1b[0m", C_BOLD="\x1b[1m", C_DIM="\x1b[2m",
-    C_GREEN="\x1b[32m", C_CYAN="\x1b[36m", C_WHITE="\x1b[97m", C_RED="\x1b[91m";
+static const string C_RESET="", C_BOLD="", C_DIM="",
+    C_GREEN="", C_CYAN="", C_WHITE="", C_RED="";
 static void ui_term_title(const string& t){ if (ui_on()) cout<<"\x1b]0;"<<t<<"\x07"; }
 // guarantees the terminal colour state is restored no matter how the session
 // ends (normal exit, /quit, EOF, Ctrl+C mid-turn, Ctrl+\, kill). without this
@@ -27,8 +27,8 @@ static void ui_term_title(const string& t){ if (ui_on()) cout<<"\x1b]0;"<<t<<"\x
 // prompt tinted. only emits when we actually own a tty.
 static void ui_terminate_reset(int sig){
     if (ui_on()){
-        const char r[]="\x1b[0m\n";
-        ssize_t n=write(STDOUT_FILENO, r, sizeof(r)-1);
+        const string r=C_RESET+"\n";
+        ssize_t n=write(STDOUT_FILENO, r.data(), r.size());
         (void)n;
     }
     signal(sig, SIG_DFL);
@@ -40,7 +40,7 @@ static void ui_install_terminate_guard(){
     signal(SIGTERM, ui_terminate_reset);
     signal(SIGHUP,  ui_terminate_reset);
     signal(SIGQUIT, ui_terminate_reset);
-    atexit([](){ if (ui_on()) fputs("\x1b[0m", stdout); });
+    atexit([](){ if (ui_on()) fputs(C_RESET.data(), stdout); });
 }
 static void ui_banner(const string& name, const string& provider, const string& model){
     if (!ui_on()) return;
