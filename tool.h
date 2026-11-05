@@ -19,6 +19,9 @@ struct tool{
 // registration is self-service: a tool file declares a static object that
 // registers itself at load time. the host only needs to link the .cpp in.
 void register_tool(tool t);
+// opmem (memory.cpp): the host calls this at the end of every turn to store
+// the user's prompt plus a one-line description of what was done. see sysprompt.
+void opmem_log(const std::string& prompt, const std::string& summary);
 const tool* find_tool(const std::string& name);
 std::vector<std::string> tool_names();
 std::string render_tools(); // the system prompt section for all registered tools

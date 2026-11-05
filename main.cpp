@@ -664,6 +664,17 @@ class agent{
             ctx.push_back({{"role", "user"}, {"content", msg}});
             save_ctx();
             maybe_audit();
+            std::vector<std::string> tnames;
+            auto opmem_done=[&](const string& extra){
+                std::string s;
+                for (auto& t : tnames) s += t + "; ";
+                std::string tail=extra;
+                size_t sp=tail.find_first_not_of(" \n\t");
+                if (sp!=string::npos) tail=tail.substr(sp);
+                for (auto& c : tail) if (c=='\n'||c=='\r'||c=='\t') c=' ';
+                if (tail.size()>140) tail=tail.substr(0,140)+"...";
+                opmem_log(msg, (s.empty()?"": "tools["+s+"] ") + tail);
+            };
             for (int round=0; round<max_tool_rounds; round++){
                 compact();
                 // a screenshot makes the payload multimodal. if the active model
@@ -696,6 +707,7 @@ class agent{
                             "in plain prose if no tool is needed. retry now."}});
                         save_ctx();
                         if (round+1>=max_tool_rounds){
+                            opmem_done("(model kept emitting an unsupported tool format)");
                             return "(the model kept emitting an unsupported tool format; "
                                    "ask again to retry)";
                         }
@@ -705,6 +717,7 @@ class agent{
 
                 size_t headerpos=rsp.find(toolh);
                 if (headerpos==string::npos){
+                    opmem_done(rsp);
                     return rsp;
                 }
                 // print any prose before the first tool header (flushed so
@@ -757,6 +770,8 @@ class agent{
                         }
                         toolres+="tool result, id: "+safe_id(tool)+'\n';
                         toolres+="tool name: "+tool.value("tool", string(""))+'\n';
+                        if (tool.contains("tool"))
+                            tnames.push_back(tool.value("tool", string("")));
                         toolres+=dispatch_tool(tool);
                         any=true;
                     }
@@ -776,6 +791,7 @@ class agent{
                 save_ctx();
             }
             cerr<<"reached max tool rounds ("<<max_tool_rounds<<")\n";
+            opmem_done("[max tool rounds reached]");
             return "[max tool rounds reached]\n";
         }
 };

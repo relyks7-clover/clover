@@ -357,7 +357,7 @@ static std::string resolve_n(int n, json& out){
         "return {ok:1,tag:el.tagName.toLowerCase()," +
         "text:(el.innerText||'').trim().slice(0,24)," +
         "x:+(r.left+r.width/2).toFixed(1),y:+(r.top+r.height/2).toFixed(1)," +
-        "w:Math.round(r.width),h:Math.round(r.height)});})()";
+        "w:Math.round(r.width),h:Math.round(r.height)};})()";
     std::string v = eval_js(js);
     if (v.rfind("error", 0) == 0) return v;
     try { out = json::parse(v); }
@@ -544,6 +544,47 @@ static std::string tool_browser(const json& args, tool_context&){
         return render_observe(v);
     }
 
+    if (action == "find"){
+        // target by text without scanning: filter the elements already
+        // numbered by the last observe. returns their [n] so the caller can
+        // click/type by index directly.
+        std::string text = args.value("text", "");
+        if (text.empty()) return "error: find needs text\n";
+        std::string js = "(function(){var t=" + json(text).dump() +
+            ".toLowerCase();var els=document.querySelectorAll('[data-clover-n]');"
+            "if(!els.length)return {err:'no numbered elements - run observe first'};"
+            "var out=[];for(var i=0;i<els.length;i++){var e=els[i];"
+            "var tx=(e.innerText||'').trim().replace(/\\s+/g,' ');"
+            "var al=e.getAttribute('aria-label')||e.getAttribute('alt')||'';"
+            "var val=String(e.value||'');"
+            "var ph=e.placeholder||'';"
+            "if((tx+' '+al+' '+val+' '+ph).toLowerCase().indexOf(t)<0)continue;"
+            "var r=e.getBoundingClientRect();"
+            "out.push({n:parseInt(e.getAttribute('data-clover-n'),10),"
+            "tag:e.tagName.toLowerCase(),text:tx.slice(0,60),"
+            "x:Math.round(r.left+r.width/2),y:Math.round(r.top+r.height/2)});}"
+            "return out;})()";
+        std::string v = eval_js(js);
+        if (v.rfind("error", 0) == 0) return v;
+        json arr;
+        try { arr = json::parse(v); }
+        catch (...){ return "error: find result did not parse\n"; }
+        if (arr.is_object())
+            return "error: " + arr.value("err", "nothing found") + "\n";
+        if (!arr.is_array() || arr.empty())
+            return "no numbered element matches \"" + text +
+                   "\"; observe again or try a shorter phrase\n";
+        std::string out = "matches for \"" + text + "\" (act by [n]):\n";
+        for (auto& e : arr){
+            out += "[" + std::to_string(e.value("n", 0)) + "] " +
+                   e.value("tag", "") +
+                   " '" + e.value("text", "") + "' @(" +
+                   std::to_string(e.value("x", 0)) + "," +
+                   std::to_string(e.value("y", 0)) + ")\n";
+        }
+        return out;
+    }
+
     if (action == "click"){
         if (!args.contains("n")) return "error: click needs n\n";
         int n = args["n"].get<int>();
@@ -585,10 +626,12 @@ static std::string tool_browser(const json& args, tool_context&){
         if (!(err = mouse_event("mouseReleased", el.value("x", 0.0),
                                 el.value("y", 0.0), 0, 1)).empty()) return err;
         {
+            // clear the field first, whether it is a real input or a contenteditable
             std::string js = "(function(){var el=document.querySelector('"
                 "[data-clover-n=\"" + std::to_string(n) + "\"]');"
-                "if(el&&(el.tagName==='INPUT'||el.tagName==='TEXTAREA'))"
-                "el.value='';"
+                "if(!el)return 0;"
+                "if(el.tagName==='INPUT'||el.tagName==='TEXTAREA')el.value='';"
+                "if(el.isContentEditable)el.innerHTML='';"
                 "return 1;})()";
             eval_js(js);
         }
@@ -597,14 +640,30 @@ static std::string tool_browser(const json& args, tool_context&){
         if (!err.empty()) return err;
         std::string js = "(function(){var el=document.querySelector('"
             "[data-clover-n=\"" + std::to_string(n) + "\"]');"
-            "return el?String(el.value!==undefined?el.value:''"
-            ".substr(0,60)):'';})()";
+            "if(!el)return '';"
+            "var t=(el.tagName==='INPUT'||el.tagName==='TEXTAREA'||el.tagName==='SELECT')?"
+            "String(el.value||''):(el.innerText||'');"
+            "return t.slice(0,60);})()";
         std::string v = eval_js(js);
         std::string nowv = (v.rfind("error", 0) == 0) ? "?" : v;
         if (!nowv.empty() && nowv[0] == '"')
             try { nowv = json::parse(nowv).get<std::string>(); } catch (...) {}
         return "typed into [" + std::to_string(n) + "] " + el.value("tag", "") +
                ". now: " + nowv + "\n";
+    }
+
+    if (action == "type_text"){
+        // type into whatever is currently focused (after a click) without an
+        // index. does NOT clear first - clearing is type(n)'s job.
+        if (!args.contains("text"))
+            return "error: type_text needs text\n";
+        std::string text = args["text"].get<std::string>();
+        if (text.empty()) return "error: type_text needs text\n";
+        json res;
+        err = cdp("Input.insertText", {{"text", text}}, res, 10);
+        if (!err.empty()) return err;
+        return "inserted " + std::to_string(text.size()) +
+               " chars into the focused element\n";
     }
 
     if (action == "press"){
@@ -715,7 +774,11 @@ static std::string tool_browser(const json& args, tool_context&){
         std::string sel = args.value("selector", "");
         if (sel.empty()) return "error: read needs selector\n";
         std::string js = "(function(){var e=document.querySelector(" +
-            json(sel).dump() +");var t=e?e.innerText:'';return t.slice(0,100000);})()";
+            json(sel).dump() +
+            ");if(!e)return '';"
+            "var t=(e.tagName==='INPUT'||e.tagName==='TEXTAREA'||e.tagName==='SELECT')?"
+            "String(e.value||''):(e.innerText||'');"
+            "return t.slice(0,100000);})()";
         std::string v = eval_js(js);
         if (v.rfind("error", 0) == 0) return v;
         try { return json::parse(v).get<std::string>() + "\n"; }
@@ -753,15 +816,16 @@ static std::string tool_browser(const json& args, tool_context&){
     }
 
     return "error: unknown action '" + action +
-           "'. actions: status, navigate, observe, click, click_xy, type, "
-           "press, hover, drag, drag_xy, scroll, read, eval, screenshot, "
+            "'. actions: status, navigate, observe, find, click, click_xy, type, "
+           "type_text, press, hover, drag, drag_xy, scroll, read, eval, screenshot, "
            "restart, close\n";
 }
 
 // the python-daemon browser tool is gone; this is THE browser tool.
 REGISTER_TOOL_DESC("browser", tool_browser,
 R"(browser(action, ...): native c++ browser automation (owns a headless chromium child, driven over raw cdp; no daemon, no second agent - the caller IS the agent loop)
--actions: status, navigate(url), observe(), click(n), click_xy(x,y), type(n,text), press(key), hover(n), drag(from_n,to_n), drag_xy(x1,y1,x2,y2), scroll(dy), read(selector), eval(js), screenshot(path?,full?), restart, close
+-actions: status, navigate(url), observe(), find(text), click(n), click_xy(x,y), type(n,text), type_text(text), press(key), hover(n), drag(from_n,to_n), drag_xy(x1,y1,x2,y2), scroll(dy), read(selector), eval(js), screenshot(path?,full?), restart, close
+-find(text): target an element by its visible text WITHOUT scanning - filters the elements already numbered by the last observe and returns their [n], so act by index directly. run observe once, then find for each target; use observe's raw list only when find can't match
 -screenshots: screenshot(path?) saves a png AND attaches it to the model as a real image (vision-capable models only); use it to actually SEE the page: grids, images, games, anything visual. prefer screenshot for visual tasks over pixel-stat evals.
 -workflow: navigate, then observe -> numbered interactive elements (tag, id, class, text, value, position, size) + page text (capped 4000 chars). act by index n. indexes refer to the last observe; stale index errors mean observe again
 -svg shapes and cursor:pointer elements are numbered with geometry; for computed positions (pie wedges, canvas) use click_xy/drag_xy with coordinates derived from observed geometry

@@ -28,6 +28,7 @@ i have the following tools:
 a permanent append-only store at ~/memory (MEMORY_DIR overrides). memories are one-line entries; older spans become one-line summaries i write via memory_nap. the raw log is the truth; summaries are a rebuildable cache.
 - at session start, run memory_wake and follow it until it says i am awake. if it asks for a compression, do it, then wake again. memory is the difference between a session and an identity.
 - memory_note anything of lasting value as it happens - a task done, a preference, a decision, a hard-won fact. never redundant notes, but err on the side of recording. right away, not at session end.
+- every user prompt is stored in opmem automatically at the end of the turn, with a brief description of what was done (tools used + the reply). that part is enforced by the harness, not by me: never manually re-log a prompt or restate what the turn did. use memory_note only for what the per-turn log does not capture - durable facts, decisions, and lessons.
 - a compression prompt in a tool reply gets answered with memory_nap before my next action.
 - to find an old memory, memory_recall first; memory_zoom navigates summaries; a bad summary gets memory_forget, then nap rebuilds it. when the user references an earlier session, assume it is in memory and go looking.
 

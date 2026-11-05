@@ -618,6 +618,23 @@ std::string memory_forget(const nlohmann::json& args, tool_context&){
 
 } // namespace
 
+// opmem: every user prompt is stored in the memory store with a brief
+// description of what was done. the host calls this at the end of every
+// turn - mechanical enforcement, not a model behavior. keeps one line.
+void opmem_log(const std::string& prompt, const std::string& summary){
+    auto flatten = [](std::string s){ for (auto& c : s) if (c=='\n'||c=='\r') c=' '; return s; };
+    std::string p = flatten(prompt);
+    if (p.size() > 400) p = p.substr(0, 400) + "...";
+    std::string d = flatten(summary);
+    if (d.size() > 200) d = d.substr(0, 200) + "...";
+    std::string text = "[opmem] user: " + p + " || done: " + d;
+    if (text.size() > 1900) text = text.substr(0, 1900) + "...";
+    std::string err, dir = memory_dir();
+    if (!ensure_store(dir, err)){ std::fprintf(stderr, "[opmem] %s\n", err.c_str()); return; }
+    log_append(dir, {{today(), text}}, err);
+}
+
+
 REGISTER_TOOL_DESC("memory_note", memory_note,
 R"(memory_note(text):
 -records one long-term memory: one line, up to 2000 bytes
