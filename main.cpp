@@ -13,6 +13,94 @@ static const string toolh="[TOOL]";
 static const string toolcontinue="<continue>";
 static const string toolrestag="[tool results]";
 
+// ---------- terminal ui ----------
+// every escape is gated on isatty(1): piped stdout (test mode, queue workers,
+// scripts) gets byte-identical output to the pre-ui build.
+static int g_ui_tty=-1;
+static bool ui_on(){ if (g_ui_tty<0) g_ui_tty=isatty(1); return g_ui_tty; }
+static const string C_RESET="\x1b[0m", C_BOLD="\x1b[1m", C_DIM="\x1b[2m",
+    C_GREEN="\x1b[32m", C_CYAN="\x1b[36m";
+static void ui_term_title(const string& t){ if (ui_on()) cout<<"\x1b]0;"<<t<<"\x07"; }
+static void ui_banner(const string& name, const string& provider, const string& model){
+    if (!ui_on()) return;
+    ui_term_title(name+" :: "+provider+"/"+model);
+    cout<<C_GREEN<<C_BOLD<<name<<C_RESET<<C_DIM<<" :: "<<C_RESET
+        <<C_CYAN<<provider<<C_RESET<<"/"<<C_CYAN<<model<<C_RESET
+        <<C_DIM<<"\n  /help for commands, /quit to exit"<<C_RESET<<'\n'<<flush;
+}
+// live turn indicator. the redraw thread is a strict join-before-print
+// lifecycle: main always joins the thread (via prose/end/resume) before it
+// writes anything else, so spinner frames can never interleave with prose.
+struct turn_indicator{
+    string name_, tag, last;
+    int rnd=0;
+    bool ever=false, midline=false;
+    chrono::steady_clock::time_point t0;
+    std::atomic<bool> run_{false};
+    std::thread th; std::mutex mu;
+    ~turn_indicator(){ end(); }
+    // turn start: metadata only; the first resume() spawns the thread.
+    void begin(const string& nm){ name_=nm; rnd=0; ever=true; midline=false;
+        t0=chrono::steady_clock::now(); }
+    // (re)start the redraw thread for a new phase; called at each loop top
+    // and before each tool dispatch. joins any prior thread first.
+    void resume(const string& ph){
+        join_thread();
+        std::lock_guard<std::mutex> g(mu);
+        tag=ph;
+        if (midline){ cout<<'\n'; midline=false; }
+        last.clear();
+        if (ui_on() && ever){ run_=true; th=std::thread([this]{ loop(); }); }
+    }
+    // leading prose is about to be printed: stop the thread, clear the
+    // spinner line if we own it. midline is recomputed from the text: a
+    // newline-terminated (or empty) prose leaves the cursor at line start.
+    void prose(const string& t){
+        join_thread();
+        std::lock_guard<std::mutex> g(mu);
+        if (ui_on() && ever && !midline){ cout<<"\r\x1b[K"; }
+        bool ends_nl = !t.empty() && t.back()=='\n';
+        midline = !t.empty() && !ends_nl;
+    }
+    // turn end: stop the thread, clear the spinner line - but only when we
+    // own the line (a partial-prose midline holds real text).
+    void end(){
+        join_thread();
+        std::lock_guard<std::mutex> g(mu);
+        if (ui_on() && ever && !midline){ cout<<"\r\x1b[K"; }
+        ever=false;
+    }
+    void join_thread(){
+        if (run_){ run_=false; if (th.joinable()) th.join(); }
+    }
+    // update the phase label for the next frame (no thread restart).
+    void set_tag(const string& ph){ std::lock_guard<std::mutex> g(mu); tag=ph; }
+    void loop(){
+        const string fr[8]={"\xe2\xa0\x8b","\xe2\xa0\x99","\xe2\xa0\xb9","\xe2\xa0\xb8",
+                            "\xe2\xa0\xbc","\xe2\xa0\xb4","\xe2\xa0\xa6","\xe2\xa0\xa7"};
+        int frame=0;
+        while (run_){
+            std::this_thread::sleep_for(chrono::milliseconds(120));
+            string out;
+            {
+                std::lock_guard<std::mutex> g(mu);
+                if (!run_) break;
+                auto el=int(chrono::duration_cast<chrono::seconds>(
+                    chrono::steady_clock::now()-t0).count());
+                char b[16];
+                if (el>=3600) snprintf(b,sizeof b,"%dh%02dm",el/3600,(el%3600)/60);
+                else if (el>=60) snprintf(b,sizeof b,"%dm%02ds",el/60,el%60);
+                else snprintf(b,sizeof b,"%ds",el);
+                out="\r"+C_DIM+fr[frame++%8]+C_RESET+" "
+                    +C_GREEN+name_+C_RESET+C_DIM+"  "+b+"  r"+to_string(rnd)+"  "+tag;
+                if (out.size()<last.size()) out+=string(last.size()-out.size(),' ');
+                last=out;
+            }
+            cout<<out<<flush;
+        }
+    }
+};
+
 struct config{
     string provider="logfare.ai";
     string web_provider="api.langsearch.com";
@@ -560,6 +648,7 @@ class agent{
         tool_context tools;
         context_store* store=nullptr;
         int max_tool_rounds=250;
+        turn_indicator ind_;
         int audit_every=25;   // self-audit every N turns; 0 disables
         string audit_path="context.json.audit";
         void save_ctx(){
@@ -661,6 +750,7 @@ class agent{
         // processes one assistant reply: prints leading text, runs any tool
         // blocks, then continues the conversation until a non-tool reply.
         string f(const string& msg){
+            ind_.begin(name);
             ctx.push_back({{"role", "user"}, {"content", msg}});
             save_ctx();
             maybe_audit();
@@ -676,6 +766,8 @@ class agent{
                 opmem_log(msg, (s.empty()?"": "tools["+s+"] ") + tail);
             };
             for (int round=0; round<max_tool_rounds; round++){
+                ind_.rnd=round+1;
+                ind_.resume("model");
                 compact();
                 // a screenshot makes the payload multimodal. if the active model
                 // cannot take images, borrow a vision model for this request and
@@ -707,6 +799,7 @@ class agent{
                             "in plain prose if no tool is needed. retry now."}});
                         save_ctx();
                         if (round+1>=max_tool_rounds){
+                            ind_.end();
                             opmem_done("(model kept emitting an unsupported tool format)");
                             return "(the model kept emitting an unsupported tool format; "
                                    "ask again to retry)";
@@ -717,11 +810,13 @@ class agent{
 
                 size_t headerpos=rsp.find(toolh);
                 if (headerpos==string::npos){
+                    ind_.end();
                     opmem_done(rsp);
                     return rsp;
                 }
                 // print any prose before the first tool header (flushed so
                 // a pty parent sees progress mid-turn)
+                ind_.prose(rsp.substr(0, headerpos));
                 cout<<rsp.substr(0, headerpos)<<flush;
 
                 string toolres=toolrestag+"\n";
@@ -772,6 +867,7 @@ class agent{
                         toolres+="tool name: "+tool.value("tool", string(""))+'\n';
                         if (tool.contains("tool"))
                             tnames.push_back(tool.value("tool", string("")));
+                        ind_.set_tag("tool "+tool.value("tool", string("")));
                         toolres+=dispatch_tool(tool);
                         any=true;
                     }
@@ -791,6 +887,7 @@ class agent{
                 save_ctx();
             }
             cerr<<"reached max tool rounds ("<<max_tool_rounds<<")\n";
+            ind_.end();
             opmem_done("[max tool rounds reached]");
             return "[max tool rounds reached]\n";
         }
@@ -815,7 +912,8 @@ static int run_test(agent& a, chat_backend& chat){
 static int run_convo(agent& a, chat_backend& chat){
     while (true){
         string message, line;
-        cout<<"→ ";
+        if (ui_on()) cout<<C_GREEN<<"\u2192 ";
+        else cout<<"\u2192 ";
         cout.flush();
         if (!getline(cin, line)) {
             cout<<'\n';
@@ -838,10 +936,10 @@ static int run_convo(agent& a, chat_backend& chat){
             a.clear_context();
             cout<<"context cleared\n";
         } else if (cmd[0]=="/model"){
-            if (cmd.size()>1){ a.model=cmd[1]; a.refresh_sysprompt(); cout<<"model set to "<<a.model<<'\n'; }
+            if (cmd.size()>1){ a.model=cmd[1]; a.refresh_sysprompt(); ui_term_title(a.name+" :: "+chat.provider+"/"+a.model); cout<<"model set to "<<a.model<<'\n'; }
             else cout<<"usage: /model [model]\n";
         } else if (cmd[0]=="/provider"){
-            if (cmd.size()>1){ chat.set_provider(cmd[1]); a.refresh_sysprompt(); cout<<"provider set to "<<chat.provider<<'\n'; }
+            if (cmd.size()>1){ chat.set_provider(cmd[1]); a.refresh_sysprompt(); ui_term_title(a.name+" :: "+chat.provider+"/"+a.model); cout<<"provider set to "<<chat.provider<<'\n'; }
             else cout<<"usage: /provider [provider]\n";
         } else if (cmd[0]=="/help"){
             cout<<"/clear_ctx  /model <m>  /provider <p>  /help  /quit\n";
@@ -952,5 +1050,6 @@ int main(int argc, char** argv){
     store.save(clover.ctx, clover.model, chat.provider);
 
     if (test) return run_test(clover, chat);
+    ui_banner(clover.name, chat.provider, clover.model);
     return run_convo(clover, chat);
 }
