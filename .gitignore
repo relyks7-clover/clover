@@ -8,6 +8,9 @@ context.json
 a.out
 *.o
 
+# autonomy runtime: task queue, ledger, works registry, sources .clover.env - never ships
+.clover/
+
 # shell/machine state, not project files
 .bash_history
 .bash_logout
