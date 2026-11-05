@@ -14,9 +14,9 @@ static const string toolcontinue="<continue>";
 static const string toolrestag="[tool results]";
 
 struct config{
-    string provider="logfare.ai";
+    string provider="generativelanguage.googleapis.com";
     string web_provider="api.langsearch.com";
-    string model="deepseek-v4.1-flash-1017";
+    string model="gemini-3.8-flash";
     string promptfile="sysprompts/clover.txt";
     string chat_key=getenv("CLOVER_CHAT_KEY")?getenv("CLOVER_CHAT_KEY"):"";
     string or_key=getenv("CLOVER_OR_KEY")?getenv("CLOVER_OR_KEY"):"";
@@ -25,6 +25,7 @@ struct config{
     string purpose;
     static string chat_key_for(){ return getenv("CLOVER_CHAT_KEY")?getenv("CLOVER_CHAT_KEY"):""; }
     static string or_key_for(){ return getenv("CLOVER_OR_KEY")?getenv("CLOVER_OR_KEY"):""; }
+    static string gm_key_for(){ return getenv("CLOVER_GM_KEY")?getenv("CLOVER_GM_KEY"):""; }
 };
 
 // set when the provider hard-rejects image parts; attach_images stops
@@ -65,7 +66,20 @@ class chat_backend{
         string provider;
         string key;
         unique_ptr<clover_client> cli;
-        chat_backend(const config& c):provider(c.provider), key(c.provider=="openrouter.ai"?config::or_key_for():config::chat_key_for()){ build(); }
+        chat_backend(const config& c):provider(c.provider){ key=key_for_provider(provider); build(); }
+        // providers differ in both key env var and api path. keeping both in
+        // one place means switching providers can never half-apply.
+        static string key_for_provider(const string& p){
+            if (p=="openrouter.ai") return config::or_key_for();
+            if (p=="generativelanguage.googleapis.com") return config::gm_key_for();
+            return config::chat_key_for();
+        }
+        static string path_for_provider(const string& p){
+            if (p=="openrouter.ai") return "/api/v1/chat/completions";
+            // google exposes an openai-compatible surface under v1beta/openai
+            if (p=="generativelanguage.googleapis.com") return "/v1beta/openai/chat/completions";
+            return "/v1/chat/completions";
+        }
         void build(){
             cli=make_unique<clover_client>(provider);
             cli->set_keep_alive(false);
@@ -78,8 +92,7 @@ class chat_backend{
             provider=p;
             // providers are keyed by their own env var: openrouter uses
             // CLOVER_OR_KEY, everything else stays on CLOVER_CHAT_KEY.
-            if (provider=="openrouter.ai") key=config::or_key_for();
-            else key=config::chat_key_for();
+            key=key_for_provider(provider);
             build();
         }
         // one request attempt. returns content on 200 with a parsable
@@ -92,8 +105,7 @@ class chat_backend{
             json m; m["model"]=model;
             m["stream"]=false;
             m["messages"]=context;
-            // openrouter exposes its api under /api/v1, everyone else /v1
-            string path = (provider=="openrouter.ai") ? "/api/v1/chat/completions" : "/v1/chat/completions";
+            string path = path_for_provider(provider);
             auto res=cli->Post(path.c_str(), m.dump(), "application/json");
             if (res && res->status==200){
                 try{
@@ -807,6 +819,14 @@ int main(int argc, char** argv){
     for (int i=1;i<argc;i++){
         string a=argv[i];
         if (a=="-t"||a=="--test") test=true;
+        else if (a=="--model"){
+            if (i+1>=argc){ cerr<<"--model requires a name\n"; return 2; }
+            cfg.model=argv[++i];
+        }
+        else if (a=="--provider"){
+            if (i+1>=argc){ cerr<<"--provider requires a host\n"; return 2; }
+            cfg.provider=argv[++i];
+        }
         else if (a=="--ctx"){
             if (i+1>=argc){ cerr<<"--ctx requires a path\n"; return 2; }
             cfg.ctxfile=argv[++i];
@@ -818,6 +838,8 @@ int main(int argc, char** argv){
             cout<<"usage: "<<argv[0]<<" [-t|--test] [--ctx <path>]\n";
             cout<<"  -t, --test      read all stdin, run one turn, print result, exit\n";
             cout<<"  --ctx <path>    persistent context file (default context.json)\n";
+            cout<<"  --provider <h>  chat provider host (default logfare.ai)\n";
+            cout<<"  --model <name>  chat model name\n";
             return 0;
         } else { cerr<<"unknown argument: "<<a<<'\n'; return 2; }
     }
@@ -868,8 +890,10 @@ int main(int argc, char** argv){
 
     // keys live in the environment now; refuse to start without them so a
     // missing key is a clear startup error, never a mystery network failure.
-    if (cfg.chat_key.empty() || cfg.web_key.empty()){
-        cerr<<"error: CLOVER_CHAT_KEY / CLOVER_WEB_KEY not set (source ~/.clover.env or export them)"<<'\n';
+    string active_chat_key = chat_backend::key_for_provider(cfg.provider);
+    if (active_chat_key.empty() || cfg.web_key.empty()){
+        cerr<<"error: no chat key for provider "<<cfg.provider
+            <<" (set CLOVER_CHAT_KEY / CLOVER_OR_KEY / CLOVER_GM_KEY) and CLOVER_WEB_KEY"<<'\n';
         return 1;
     }
     chat_backend chat(cfg);
