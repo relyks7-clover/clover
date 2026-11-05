@@ -37,3 +37,6 @@ context.json.audit
 # my own non-custodial wallet - seed/private key, NEVER in a public repo
 wallet/
 
+
+# self-modification recovery snapshots - local only, source-only, never ship
+archives/
