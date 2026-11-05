@@ -169,6 +169,40 @@ using clover_client = httplib::Client;
 using clover_client = httplib::SSLClient;
 #endif
 
+ // copies the full SSE body into a plain string: httplib buffers the whole
+ // response, so a stream:true response arrives here as text. reassembles
+ // every choices[0].delta.content into one answer. finish is the last
+ // non-null finish_reason. empty string on no content.
+ static string parse_sse_content(const string& body, string& finish){
+     string out; finish.clear(); size_t pos=0;
+     while (pos<body.size()){
+         size_t eol=body.find('\n',pos);
+         string line = eol==string::npos ? body.substr(pos) : body.substr(pos,eol-pos);
+         pos = eol==string::npos ? body.size() : eol+1;
+         if (!line.empty() && line.back()=='\r') line.pop_back();
+         if (line.rfind("data: ",0)!=0) continue;
+         string payload=line.substr(6);
+         if (payload=="[DONE]" || payload.empty()) break;
+         try{
+             auto d=json::parse(payload);
+             if (!d.contains("choices") || !d["choices"].is_array() || d["choices"].empty()) continue;
+             auto& c0=d["choices"][0];
+             if (c0.contains("delta")){
+                 auto& delta=c0["delta"];
+                 if (delta.contains("content") && delta["content"].is_string())
+                     out+=delta["content"].get<string>();
+             }
+             if (c0.contains("finish_reason") && c0["finish_reason"].is_string())
+                 finish=c0["finish_reason"].get<string>();
+         }catch(...){ /* keepalive / non-json line: skip */ }
+     }
+     return out;
+ }
+ // the zarnkina relay's NON-STREAM path garbles its reasoning models (returns a
+ // truncated fragment with inconsistent usage); its STREAM path is clean.
+ // so we request SSE from this provider and reassemble content from deltas.
+ static bool provider_needs_stream(const string& p){ return p=="scandata-relay.zarnkina.workers.dev"; }
+ 
 class chat_backend{
     public:
         string provider;
@@ -212,12 +246,19 @@ class chat_backend{
         string attempt(const string& model, const json& context, string& err){
             err.clear();
             json m; m["model"]=model;
-            m["stream"]=false;
+            m["stream"]=provider_needs_stream(provider);
             m["messages"]=context;
             string path = path_for_provider(provider);
             auto res=cli->Post(path.c_str(), m.dump(), "application/json");
             if (res && res->status==200){
                 try{
+                    if (provider_needs_stream(provider)){
+                        string finish;
+                        string content=parse_sse_content(res->body, finish);
+                        if (content.empty())
+                            { cerr<<"stream: no content (finish="<<finish<<")\n"; err="retry"; return ""; }
+                        return content;
+                    }
                     auto resp_json=json::parse(res->body);
                     if (!resp_json.contains("choices") || resp_json["choices"].empty())
                         { cerr<<"unexpected response shape\n"; err="retry"; return ""; }
