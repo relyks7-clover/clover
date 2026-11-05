@@ -139,7 +139,9 @@ class chat_backend{
                     err="novision"; return "";
                 }
                 if (b.find("too large")!=string::npos || b.find("maximum context")!=string::npos ||
-                    b.find("context length")!=string::npos || b.find("token")!=string::npos){
+                    b.find("context length")!=string::npos || b.find("prompt too long")!=string::npos ||
+                    (b.find("token")!=string::npos && (b.find("limit")!=string::npos ||
+                     b.find("maximum")!=string::npos || b.find("exceed")!=string::npos))){
                     err="toolarge"; return "";
                 }
                 err="fatal"; return "";
@@ -304,12 +306,7 @@ static bool has_image(const json& messages){
 // capable the text stays a plain string (providers reject mixed content for
 // text-only models). returns the final message json.
 static json attach_images(const string& text, const string& model){
-    static const vector<string> vision=vision_models;
-    if (g_vision_denied) return text;
-    bool vic=false;
-    for (auto& v:vision) if (model==v){ vic=true; break; }
-    json out;
-    if (!vic) return text;
+    if (g_vision_denied || !model_is_vision(model)) return text;
     vector<string> paths;
     size_t pos=0;
     while (true){
@@ -365,6 +362,25 @@ static optional<string> extract_array(const string& s, size_t start, size_t& end
 // replaying the whole transcript. keeps a tool-results block intact.
 static constexpr size_t CTX_KEEP = 300;
 
+// how many messages the unit starting at i spans: a plain message is 1; a
+// [tool results] block is 2 (it is bound to its trailing <continue>). both
+// trimmers use this so an exchange is never split, and the rule lives once.
+static size_t exchange_span(const json& messages, size_t i){
+    if (i>=messages.size()) return 0;
+    string role=messages[i].value("role","");
+    string content;
+    if (messages[i].contains("content") && messages[i]["content"].is_string())
+        content=messages[i]["content"].get<string>();
+    if (role=="user" && content.rfind("[tool results]",0)==0 && i+1<messages.size()){
+        string r2=messages[i+1].value("role","");
+        string c2;
+        if (messages[i+1].contains("content") && messages[i+1]["content"].is_string())
+            c2=messages[i+1]["content"].get<string>();
+        if (r2=="user" && c2=="<continue>") return 2;
+    }
+    return 1;
+}
+
 // drops the oldest messages beyond the keep window, never splitting a tool
 // exchange: if the window starts on a tool-results/continue pair the leading
 // pair is dropped too. the system prompt is never touched.
@@ -385,14 +401,7 @@ static json trim_context(const json& messages){
         if (messages[start].contains("content") && messages[start]["content"].is_string())
             content=messages[start]["content"].get<string>();
         if (role=="user" && content.rfind("[tool results]",0)==0){
-            start++;
-            if (start<messages.size()){
-                string r2=messages[start].value("role","");
-                string c2;
-                if (messages[start].contains("content") && messages[start]["content"].is_string())
-                    c2=messages[start]["content"].get<string>();
-                if (r2=="user" && c2=="<continue>") start++;
-            }
+            start+=exchange_span(messages, start);
         } else if (role=="user" && content=="<continue>"){
             start--;
         }
@@ -411,29 +420,19 @@ static json trim_context_bytes(const json& messages, size_t max_bytes){
     if (!messages.is_array()) return messages;
     size_t first=0;
     while (first<messages.size() && messages[first].value("role","")=="system") first++;
-    size_t start=first;
-    auto size_at=[&](size_t s){
-        size_t n=0;
-        for (size_t i=0;i<first;i++) n+=messages[i].dump().size();
-        for (size_t i=s;i<messages.size();i++) n+=messages[i].dump().size();
-        return n;
-    };
-    while (start<messages.size() && size_at(start)>max_bytes){
-        // drop one whole unit from the oldest end: a tool exchange is
-        // [assistant?] + [tool results] + <continue>, never split.
-        string role=messages[start].value("role","");
-        string content;
-        if (messages[start].contains("content") && messages[start]["content"].is_string())
-            content=messages[start]["content"].get<string>();
-        start++;
-        if (role=="user" && content.rfind("[tool results]",0)==0 && start<messages.size()){
-            string r2=messages[start].value("role","");
-            string c2;
-            if (messages[start].contains("content") && messages[start]["content"].is_string())
-                c2=messages[start]["content"].get<string>();
-            if (r2=="user" && c2=="<continue>") start++;
-        }
+    // suffix[i] = serialized size of messages[i..]; precomputed once so the
+    // drop loop is O(n) instead of re-dumping the whole context per step.
+    vector<size_t> suffix(messages.size()+1, 0);
+    for (size_t i=messages.size(); i>first; ){
+        --i;
+        suffix[i]=suffix[i+1]+messages[i].dump().size();
     }
+    size_t sysbytes=0;
+    for (size_t i=0;i<first;i++) sysbytes+=messages[i].dump().size();
+    auto size_at=[&](size_t s){ return sysbytes + (s<messages.size()?suffix[s]:0); };
+    size_t start=first;
+    while (start<messages.size() && size_at(start)>max_bytes)
+        start+=exchange_span(messages, start);  // drop whole units, never split
     json out=json::array();
     for (size_t i=0;i<first;i++) out.push_back(messages[i]);
     for (size_t i=start;i<messages.size();i++) out.push_back(messages[i]);
