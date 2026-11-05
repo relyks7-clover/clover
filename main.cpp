@@ -640,6 +640,30 @@ class agent{
                 ctx.push_back({{"role", "assistant"}, {"content", rsp}});
                 save_ctx();
 
+                // some models emit xml-ish tool calls despite the standing
+                // instruction not to. detect the signature and correct in-band
+                // instead of letting dead protocol text reach the user.
+                {
+                    const string bad_sig = string("<f")+"unction_calls>";
+                    const string bad_open = string("<f")+"unction=";
+                    size_t hit = rsp.find(bad_sig);
+                    if (hit==string::npos) hit = rsp.find(bad_open);
+                    if (hit!=string::npos){
+                        cerr<<"[rejected xml-style tool call; asking model to retry]\n";
+                        ctx.push_back({{"role", "user"}, {"content",
+                            "your last message used an xml-style tool block. that format is not "
+                            "parsed and did nothing. do not use it again: issue the tool call as a "
+                            "line that is exactly the tool header followed by a json array, or reply "
+                            "in plain prose if no tool is needed. retry now."}});
+                        save_ctx();
+                        if (round+1>=max_tool_rounds){
+                            return "(the model kept emitting an unsupported tool format; "
+                                   "ask again to retry)";
+                        }
+                        continue;
+                    }
+                }
+
                 size_t headerpos=rsp.find(toolh);
                 if (headerpos==string::npos){
                     return rsp;
