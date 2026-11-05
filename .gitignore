@@ -24,3 +24,9 @@ browserenv/
 # tool temp files on crash
 *.wr.tmp
 *.edit.tmp
+
+# research material (local reference only, not shipped)
+repos-browseruse/
+
+# runtime state
+context.json.audit
