@@ -8,6 +8,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <sys/prctl.h>
 #include <pty.h>
 #include <signal.h>
 #include <termios.h>
@@ -29,6 +30,8 @@ struct session{
     pid_t pid=-1;
     int fd=-1;
     std::string out;
+    time_t deadline=0;  // absolute time the command must finish by; 0 = none
+    int timeout_s=0;    // the requested seconds, for the report
 };
 
 std::mutex g_mu;
@@ -42,23 +45,30 @@ void append(session& s, const char* buf, size_t n){
         s.out.erase(0, s.out.size()-MAX_OUT);
 }
 
-// drain available bytes without blocking. returns true if child stopped
-// producing (idle) while still alive.
-bool pump(session& s, int idle_ms){
+// pump returns: 0 = child eof/error (exiting), 1 = idle (prompt), 2 = deadline hit (killed).
+int pump(session& s, int idle_ms){
     char buf[4096];
     for(;;){
+        int wait_ms=idle_ms;
+        if (s.deadline){
+            long remain=(long)(s.deadline - time(nullptr))*1000;
+            if (remain<=0){ kill(-s.pid, SIGKILL); return 2; }
+            if (remain<wait_ms) wait_ms=(int)remain;
+        }
         struct pollfd pfd{s.fd, POLLIN, 0};
-        int pr=poll(&pfd, 1, idle_ms);
+        int pr=poll(&pfd, 1, wait_ms);
         if (pr<0){
             if (errno==EINTR) continue;
-            return false;
+            return 0;
         }
-        if (pr==0) return true; // timeout: idle, child still alive -> likely prompt
+        if (pr==0){
+            if (s.deadline && (long)(s.deadline - time(nullptr))<=0){ kill(-s.pid, SIGKILL); return 2; }
+            return 1; // quiet while alive -> prompt
+        }
         if (pfd.revents & (POLLIN|POLLHUP|POLLERR)){
             ssize_t n=read(s.fd, buf, sizeof(buf));
             if (n>0){ append(s, buf, (size_t)n); continue; }
-            // n==0 or error/EIO => child side closed
-            return false;
+            return 0; // eof/error: child side closed
         }
     }
 }
@@ -119,19 +129,37 @@ std::string finish_message(int st, const std::string& out){
 // is done (caller drops the session); finished=false means it is paused at a
 // prompt and the caller keeps the session.
 void drive(session& s, std::string& result, bool& finished){
-    bool idle=pump(s, IDLE_MS);
-    if (idle){
+    int p=pump(s, IDLE_MS);
+    if (p==2){
+        // deadline: the whole group was killed in pump; reap and report.
+        int st=0;
+        while (waitpid(s.pid, &st, 0)<0 && errno==EINTR) {}
+        drain(s);
+        result="timeout after "+std::to_string(s.timeout_s)+"s; output so far:\n"+s.out+"\n";
+        finished=true;
+        return;
+    }
+    if (p==1){
         // alive but quiet. it may be prompting, or exiting right now (the pty
         // can go quiet a beat before EOF). short grace to catch imminent exit
         // or trailing output before we commit to "paused".
-        for (int i=0; i<8 && idle; i++){
+        for (int i=0; i<8; i++){
             int st0=try_reap(s);
             if (st0!=-1){ drain(s); result=finish_message(st0, s.out); finished=true; return; }
-            bool still=pump(s, 50);
-            if (!still) idle=false; // got EOF/EIO: child is exiting
+            int still=pump(s, 50);
+            if (still!=1) break; // eof, or deadline (handled below)
+        }
+        p=pump(s, IDLE_MS);
+        if (p==2){
+            int st=0;
+            while (waitpid(s.pid, &st, 0)<0 && errno==EINTR) {}
+            drain(s);
+            result="timeout after "+std::to_string(s.timeout_s)+"s; output so far:\n"+s.out+"\n";
+            finished=true;
+            return;
         }
     }
-    if (!idle){
+    if (p==0){
         // pty closed: the child is exiting/exited. blocking reap is correct
         // here (WNOHANG can miss the status for a moment after EOF).
         int st=0;
@@ -247,6 +275,11 @@ static std::string tool_run_command(const nlohmann::json& args, tool_context&){
     if (!args.contains("command"))
         return "error: missing 'command' argument (or provide session_id to continue a session)\n";
     std::string rcommand=args["command"].get<std::string>();
+    int timeout_s=0;
+    if (args.contains("timeout") && args["timeout"].is_number())
+        timeout_s=args["timeout"].get<int>();
+    if (timeout_s<1) timeout_s=0;
+    if (timeout_s>3600) timeout_s=3600;
 
     // the pty merges stderr into the terminal; the raw command goes to bash -lc
 
@@ -265,11 +298,14 @@ static std::string tool_run_command(const nlohmann::json& args, tool_context&){
     if (pid<0) return std::string("forkpty failed: ")+strerror(errno)+"\n";
     // own process group so cancel can kill the whole subtree, not just the
     // bash: a 'bash -lc "sleep 300"' cancelled must not leave the sleep alive.
-    // double setpgid like the subagent tool: whichever lands first wins.
-    setpgid(pid, pid);
+    // note: forkpty already setsid()s the child (new session + group leader),
+    // so the subtree shares one group with no extra call. an explicit parent
+    // setpgid here is not just redundant - empirically it breaks command
+    // execution (child exits 1 before running anything).
     if (pid==0){
-        // child
-        setpgid(0, 0);
+        // die with the parent: if the agent process exits or crashes, no
+        // orphaned command trees. the pty's hangup then hups the subtree.
+        prctl(PR_SET_PDEATHSIG, SIGKILL);
         execl("/bin/bash", "bash", "-lc", rcommand.c_str(), (char*)nullptr);
         _exit(127);
     }
@@ -277,6 +313,8 @@ static std::string tool_run_command(const nlohmann::json& args, tool_context&){
     fcntl(master, F_SETFL, fcntl(master, F_GETFL, 0) | O_NONBLOCK);
     int id=g_next_id++;
     session s; s.pid=pid; s.fd=master;
+    s.timeout_s=timeout_s;
+    if (timeout_s) s.deadline=time(nullptr)+timeout_s;
 
     std::string result; bool finished=false;
     drive(s, result, finished);
@@ -286,6 +324,6 @@ static std::string tool_run_command(const nlohmann::json& args, tool_context&){
 }
 
 REGISTER_TOOL_DESC("run_command", tool_run_command,
-R"(run_command(command):
--runs a command in my ubuntu 24.04 sandbox
+R"(run_command(command, timeout?):
+-runs a command in my ubuntu 24.04 sandbox; optional timeout (1-3600s) bounds total runtime and kills the whole process group on expiry
 -if the command goes quiet for 30s while still running, returns with a session_id; reply by calling run_command again with {"session_id": N, "input": "text"} or {"session_id": N, "cancel": true}; empty input keeps waiting)");
