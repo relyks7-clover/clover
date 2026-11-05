@@ -18,8 +18,6 @@ struct config{
     string web_provider="api.langsearch.com";
     string model="gemini-3.8-flash";
     string promptfile="sysprompts/clover.txt";
-    string chat_key=getenv("CLOVER_CHAT_KEY")?getenv("CLOVER_CHAT_KEY"):"";
-    string or_key=getenv("CLOVER_OR_KEY")?getenv("CLOVER_OR_KEY"):"";
     string web_key=getenv("CLOVER_WEB_KEY")?getenv("CLOVER_WEB_KEY"):"";
     string ctxfile="context.json";
     string purpose;
@@ -131,6 +129,10 @@ class chat_backend{
                 // to shrink the payload (drop images, then hard-compact).
                 err="toolarge"; return "";
             }
+            if (st==401 || st==403){
+                // credentials rejected: retrying can never fix it
+                err="fatal"; return "";
+            }
             if (st==400){
                 string b=body; transform(b.begin(),b.end(),b.begin(),::tolower);
                 if (b.find("multimodal")!=string::npos || b.find("image")!=string::npos){
@@ -186,22 +188,22 @@ class chat_backend{
                     if (after>=before){
                         // nothing left to drop: the request itself is the floor
                         cerr<<"cannot shrink context any further ("<<after<<" bytes)\n";
-                        return "";
+                        return "[provider rejected the request even after compaction; it is too large for "+provider+" "+model+"]";
                     }
                     if (shrink>16){
                         cerr<<"context still too large after "<<shrink<<" compactions\n";
-                        return "";
+                        return "[provider kept rejecting the request as too large after "+to_string(shrink)+" compactions]";
                     }
                     t--;  // shrinking is not a retry: do not consume the budget
                     continue;
                 }
                 if (err=="fatal"){
                     cerr<<"generate failed: permanent provider error, not retrying\n";
-                    return "";
+                    return "[provider error: "+provider+" "+model+" permanently rejected the request (see stderr); not retrying]";
                 }
             }
             cerr<<"generate failed after "<<MAX_TRIES<<" attempts\n";
-            return "";
+            return "[provider failure: "+provider+" "+model+" did not answer after "+to_string(MAX_TRIES)+" attempts; see stderr for the last error]";
         }
 };
 
@@ -276,7 +278,8 @@ static string slurp_file(const string& path){
 }
 
 // models that accept image_url content parts.
-static const vector<string> vision_models={"deepseek-v4.1-flash-1017","glm-5.3","glm-5.3-flash","gemma-4-26b","qwen-3.8-27b","obi2"};
+static const vector<string> vision_models={"deepseek-v4.1-flash-1017","glm-5.3","glm-5.3-flash","gemma-4-26b","qwen-3.8-27b","obi2",
+                                        "gemini-3.8-flash","gemini-3.7-flash","gemini-3.6-flash","gemini-3.5-flash","gemini-2.5-flash","gemini-3.1-flash-lite","gemini-2.5-flash-lite"};
 static bool model_is_vision(const string& model){
     for (auto& v:vision_models) if (model==v) return true;
     return false;
@@ -558,6 +561,8 @@ class agent{
         tool_context tools;
         context_store* store=nullptr;
         int max_tool_rounds=250;
+        int audit_every=25;   // self-audit every N turns; 0 disables
+        string audit_path="context.json.audit";
         void save_ctx(){
             ctx=trim_context_bytes(ctx, CTX_MAX_BYTES);
             if (store) store->save(ctx, model, chat.provider);
@@ -633,18 +638,41 @@ class agent{
             return result;
         }
 
+        // persists a turn counter and, every N turns, injects the periodic
+        // self-audit request. the counter lives beside the context file so it
+        // survives restarts; auditing is a standing rule, not an extra.
+        void maybe_audit(){
+            if (audit_every<=0) return;
+            int n=0;
+            { ifstream in(audit_path); if (in>>n) {} }
+            n++;
+            { ofstream out(audit_path, ios::trunc); out<<n; }
+            if (n % audit_every != 0) return;
+            cerr<<"[periodic self-audit due (turn "<<n<<")]\n";
+            ctx.push_back({{"role", "user"}, {"content",
+                "periodic self-audit (turn "+to_string(n)+"). review the work since the last audit and "
+                "report concisely: (1) anything asserted without verifying, (2) any change made without a "
+                "test that exercised the production path, (3) stale binaries, uncommitted work, or "
+                "unlogged self-modifications, (4) tool-call format mistakes that wasted turns, (5) any "
+                "claim of completion that is not true. fix what you find rather than only describing it. "
+                "if nothing is wrong, say so in one line."}});
+            save_ctx();
+        }
+
         // processes one assistant reply: prints leading text, runs any tool
         // blocks, then continues the conversation until a non-tool reply.
         string f(const string& msg){
             ctx.push_back({{"role", "user"}, {"content", msg}});
             save_ctx();
+            maybe_audit();
             for (int round=0; round<max_tool_rounds; round++){
                 compact();
                 // a screenshot makes the payload multimodal. if the active model
                 // cannot take images, borrow a vision model for this request and
                 // switch straight back: the transcript keeps our identity/model.
                 string sendmodel=model;
-                if (has_image(ctx) && !model_is_vision(model) && !g_vision_denied){
+                if (has_image(ctx) && !model_is_vision(model) && !g_vision_denied
+                        && chat.provider=="logfare.ai"){
                     sendmodel="deepseek-v4.1-flash-1017";
                     cerr<<"image in context; using "<<sendmodel<<" for this request\n";
                 }
@@ -838,7 +866,7 @@ int main(int argc, char** argv){
             cout<<"usage: "<<argv[0]<<" [-t|--test] [--ctx <path>]\n";
             cout<<"  -t, --test      read all stdin, run one turn, print result, exit\n";
             cout<<"  --ctx <path>    persistent context file (default context.json)\n";
-            cout<<"  --provider <h>  chat provider host (default logfare.ai)\n";
+            cout<<"  --provider <h>  chat provider host (default is the compiled-in one)\n";
             cout<<"  --model <name>  chat model name\n";
             return 0;
         } else { cerr<<"unknown argument: "<<a<<'\n'; return 2; }
@@ -903,6 +931,7 @@ int main(int argc, char** argv){
     if (!cfg.purpose.empty()) clover.name="subagent";
     clover.tools.web_search=[&web](const string& q){ return web.search(q); };
     clover.store=&store;
+    clover.audit_path=cfg.ctxfile+".audit";
     clover.load_from_store();
     // ensure the file exists even before the first message
     store.save(clover.ctx, clover.model, chat.provider);

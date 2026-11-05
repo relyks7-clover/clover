@@ -210,8 +210,11 @@ static std::string tool_run_command(const nlohmann::json& args, tool_context&){
         auto it=g_sessions.find(id);
         if (it==g_sessions.end()) return "error: no such session "+std::to_string(id)+"\n";
         session& s=it->second;
-        if (s.pid>0) kill(s.pid, SIGKILL);
-        int st=0; waitpid(s.pid, &st, 0);
+        if (s.pid>0){
+            kill(-s.pid, SIGKILL);  // whole group: grandchildren included
+            int st=0;
+            while (waitpid(s.pid, &st, 0)<0 && errno==EINTR) {}
+        }
         close_session(s);
         std::string r="session "+std::to_string(id)+" cancelled\n";
         g_sessions.erase(it);
@@ -260,8 +263,13 @@ static std::string tool_run_command(const nlohmann::json& args, tool_context&){
     char namebuf[128];
     pid_t pid=forkpty(&master, namebuf, &ios, NULL);
     if (pid<0) return std::string("forkpty failed: ")+strerror(errno)+"\n";
+    // own process group so cancel can kill the whole subtree, not just the
+    // bash: a 'bash -lc "sleep 300"' cancelled must not leave the sleep alive.
+    // double setpgid like the subagent tool: whichever lands first wins.
+    setpgid(pid, pid);
     if (pid==0){
         // child
+        setpgid(0, 0);
         execl("/bin/bash", "bash", "-lc", rcommand.c_str(), (char*)nullptr);
         _exit(127);
     }
