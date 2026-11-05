@@ -123,9 +123,9 @@ struct turn_indicator{
 };
 
 struct config{
-    string provider="logfare.ai";
+    string provider="scandata-relay.zarnkina.workers.dev";
     string web_provider="api.langsearch.com";
-    string model="qwen-3.8-27b";
+    string model="zarnkina-gpt-6.1-sol";
     string promptfile="sysprompts/clover.txt";
     string web_key=getenv("CLOVER_WEB_KEY")?getenv("CLOVER_WEB_KEY"):"";
     string ctxfile="context.json";
