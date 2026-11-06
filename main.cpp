@@ -937,13 +937,22 @@ class agent{
                 }
 
                 size_t headerpos=rsp.find(toolh);
-                if (ui_on() && !sd_hidden && sd_frozen<rsp.size()){
-                    // no tool header: the answer is plain prose - flush the
-                    // withheld tail so the whole reply lands on screen.
-                    string part=rsp.substr(sd_frozen);
-                    ind_.prose(part);
-                    cout<<part<<flush;
-                    sd_frozen=rsp.size();
+                if (ui_on()){
+                    // Flush withheld prose up to (but never including) the
+                    // tool header. A header can arrive in the very first delta.
+                    // A generated failure notice replaces the partial stream;
+                    // its offsets are unrelated to the text already displayed.
+                    size_t end=headerpos==string::npos ? rsp.size() : headerpos;
+                    if (rsp.compare(0, sd_frozen, held, 0, sd_frozen)!=0){
+                        if (sd_frozen) { ind_.prose("\n"); cout<<'\n'; }
+                        sd_frozen=0;
+                    }
+                    if (sd_frozen<end){
+                        string part=rsp.substr(sd_frozen, end-sd_frozen);
+                        ind_.prose(part);
+                        cout<<part<<flush;
+                        sd_frozen=end;
+                    }
                 }
                 if (headerpos==string::npos){
                     ind_.end();
