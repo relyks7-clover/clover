@@ -8,6 +8,11 @@
 // host supplies callables. add fields here as new shared services appear.
 struct tool_context{
     std::function<std::string(const std::string& query)> web_search;
+    // the session's current provider/model: subagent children must run on
+    // the same provider (a quota-exhausted default would burn every child
+    // even when the session was pinned to a healthy one).
+    std::function<std::string()> chat_provider;
+    std::function<std::string()> chat_model;
 };
 
 struct tool{

@@ -1107,6 +1107,8 @@ int main(int argc, char** argv){
     agent clover(cfg.model, system_prompt, "☘ clover", chat, web);
     if (!cfg.purpose.empty()) clover.name="subagent";
     clover.tools.web_search=[&web](const string& q){ return web.search(q); };
+    clover.tools.chat_provider=[&chat](){ return chat.provider; };
+    clover.tools.chat_model=[&clover](){ return clover.model; };
     clover.store=&store;
     clover.audit_path=cfg.ctxfile+".audit";
     clover.load_from_store();

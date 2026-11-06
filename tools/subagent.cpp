@@ -15,7 +15,7 @@
 // every tool, so recursion is native; depth is capped via SUBAGENT_DEPTH.
 // the provider allows one request at a time, so this tool blocks until the
 // child exits: batched calls in one array still run strictly sequentially.
-static std::string tool_subagent(const nlohmann::json& args, tool_context&){
+static std::string tool_subagent(const nlohmann::json& args, tool_context& tctx){
     if (!args.contains("task"))
         return "error: missing 'task' argument\n";
     std::string task=args["task"].get<std::string>();
@@ -58,6 +58,13 @@ static std::string tool_subagent(const nlohmann::json& args, tool_context&){
     }
     int infd=open(taskfile.c_str(), O_RDONLY);
 
+    // inherit the session's provider/model: a child on a quota-exhausted
+    // default provider (when the session is pinned elsewhere) would burn
+    // every request on 429s. fall back to defaults when the host hasn't
+    // wired the getters (standalone builds).
+    std::string provider = tctx.chat_provider ? tctx.chat_provider() : "";
+    std::string model    = tctx.chat_model    ? tctx.chat_model()    : "";
+
     int outfd=open((sdir+"/out").c_str(), O_CREAT|O_RDWR, 0600);
     int errfd=open((sdir+"/err").c_str(), O_CREAT|O_RDWR, 0600);
     if (outfd<0 || errfd<0) return "error: cannot open capture files\n";
@@ -77,8 +84,13 @@ static std::string tool_subagent(const nlohmann::json& args, tool_context&){
         setenv("SUBAGENT_DEPTH", std::to_string(depth+1).c_str(), 1);
         setenv("MEMORY_DIR", (sdir+"/mem").c_str(), 1);
         mkdir((sdir+"/mem").c_str(), 0700);
-        execl(exe.c_str(), exe.c_str(), "-t", "--ctx", ctx.c_str(),
-              "--purpose", purpose.c_str(), (char*)nullptr);
+        std::vector<std::string> argv{exe, "-t", "--ctx", ctx, "--purpose", purpose};
+        if (!provider.empty()){ argv.push_back("--provider"); argv.push_back(provider); }
+        if (!model.empty()){ argv.push_back("--model"); argv.push_back(model); }
+        std::vector<char*> argvc;
+        for (auto& a : argv) argvc.push_back(a.data());
+        argvc.push_back(nullptr);
+        execv(exe.c_str(), argvc.data());
         _exit(127);
     }
     close(outfd); close(errfd); close(infd);
