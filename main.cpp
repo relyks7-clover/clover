@@ -520,13 +520,11 @@ static optional<string> extract_array(const string& s, size_t start, size_t& end
 // replaying the whole transcript. keeps a tool-results block intact.
 static constexpr size_t CTX_KEEP = 300;
 
-// proactive per-model context budget: a safety fraction of the model's real
-// window, in bytes. compact() trims at THIS limit, not the global
-// CTX_MAX_BYTES: running to the provider's hard limit either degrades the
-// model (near-window long context measurably breaks structured output) or
-// lands on a 413 that forces the reactive halve-shrink path. known windows
-// from each provider's /v1/models; the 3/4 fraction leaves room for the
-// current turn's output + tool round-trips before the window is truly hit.
+// Proactive byte heuristic, not a tokenizer or a guaranteed context fit.
+// Relay windows were observed from /v1/models; the logfare value below is
+// an assumption. Three bytes per window token estimates 75% occupancy at
+// four bytes/token, but token density varies across languages and payloads.
+// Keep reactive provider-size handling as the final safety net.
 static size_t context_budget_bytes(const string& model, const string& provider){
     long long window_tokens=0;
     if (provider=="scandata-relay.zarnkina.workers.dev"){
