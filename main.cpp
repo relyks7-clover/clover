@@ -520,6 +520,38 @@ static optional<string> extract_array(const string& s, size_t start, size_t& end
 // replaying the whole transcript. keeps a tool-results block intact.
 static constexpr size_t CTX_KEEP = 300;
 
+// proactive per-model context budget: a safety fraction of the model's real
+// window, in bytes. compact() trims at THIS limit, not the global
+// CTX_MAX_BYTES: running to the provider's hard limit either degrades the
+// model (near-window long context measurably breaks structured output) or
+// lands on a 413 that forces the reactive halve-shrink path. known windows
+// from each provider's /v1/models; the 3/4 fraction leaves room for the
+// current turn's output + tool round-trips before the window is truly hit.
+static size_t context_budget_bytes(const string& model, const string& provider){
+    long long window_tokens=0;
+    if (provider=="scandata-relay.zarnkina.workers.dev"){
+        if (model=="zarnkina-gpt-6.1-sol" || model=="zarnkina-gpt-6-astra" ||
+            model=="zarnkina-gpt-6.1-terra" || model=="zarnkina-gpt-6-sol") window_tokens=256000;
+        else if (model=="zarnkina-mercury-3") window_tokens=1000000;
+        else if (model=="zarnkina-mercury-2.5") window_tokens=260000;
+        else if (model=="zarnkina-mercury-2") window_tokens=128000;
+        else if (model=="zarnkina-deepseek-v4-flash") window_tokens=400000;
+        else if (model=="zarnkina-minimax-m2.7") window_tokens=180000;
+        else if (model=="zarnkina-glm-5.3-flash") window_tokens=400000;
+    } else if (provider=="logfare.ai"){
+        // logfare does not publish windows; qwen-3.8-27b is 128K class
+        if (model=="qwen-3.8-27b") window_tokens=128000;
+    }
+    if (window_tokens>0){
+        size_t budget = (size_t)(window_tokens * 3 / 4) * 4; // ~4 bytes/token
+        if (budget<32*1024) budget=32*1024;
+        if (budget>CTX_MAX_BYTES) budget=CTX_MAX_BYTES;
+        return budget;
+    }
+    // unknown model: stay under the global cap with headroom
+    return (size_t)((double)CTX_MAX_BYTES * 0.75);
+}
+
 // how many messages the unit starting at i spans: a plain message is 1; a
 // [tool results] block is 2 (it is bound to its trailing <continue>). both
 // trimmers use this so an exchange is never split, and the rule lives once.
@@ -722,7 +754,7 @@ class agent{
         int audit_every=25;   // self-audit every N turns; 0 disables
         string audit_path="context.json.audit";
         void save_ctx(){
-            ctx=trim_context_bytes(ctx, CTX_MAX_BYTES);
+            ctx=trim_context_bytes(ctx, context_budget_bytes(model, chat.provider));
             if (store) store->save(ctx, model, chat.provider);
         }
         // trim in memory right before the request is sent: the file is only
@@ -731,10 +763,11 @@ class agent{
         // first: they are the densest bytes in the transcript and a stale
         // screenshot is worth less than the exchanges it would evict.
         void compact(){
-            if (ctx.dump().size()<=CTX_MAX_BYTES) return;
+            size_t budget=context_budget_bytes(model, chat.provider);
+            if (ctx.dump().size()<=budget) return;
             json lean=strip_images(ctx);
-            if (lean.dump().size()<=CTX_MAX_BYTES){ ctx=lean; return; }
-            ctx=trim_context_bytes(lean, CTX_MAX_BYTES);
+            if (lean.dump().size()<=budget){ ctx=lean; return; }
+            ctx=trim_context_bytes(lean, budget);
         }
         agent(const string& modelname, const string& sysprompt, const string& agentname,
               chat_backend& ch, web_backend& wb)
