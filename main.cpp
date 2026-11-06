@@ -169,39 +169,37 @@ using clover_client = httplib::Client;
 using clover_client = httplib::SSLClient;
 #endif
 
- // copies the full SSE body into a plain string: httplib buffers the whole
- // response, so a stream:true response arrives here as text. reassembles
- // every choices[0].delta.content into one answer. finish is the last
- // non-null finish_reason. empty string on no content.
- static string parse_sse_content(const string& body, string& finish){
-     string out; finish.clear(); size_t pos=0;
-     while (pos<body.size()){
-         size_t eol=body.find('\n',pos);
-         string line = eol==string::npos ? body.substr(pos) : body.substr(pos,eol-pos);
-         pos = eol==string::npos ? body.size() : eol+1;
-         if (!line.empty() && line.back()=='\r') line.pop_back();
-         if (line.rfind("data: ",0)!=0) continue;
-         string payload=line.substr(6);
-         if (payload=="[DONE]" || payload.empty()) break;
-         try{
-             auto d=json::parse(payload);
-             if (!d.contains("choices") || !d["choices"].is_array() || d["choices"].empty()) continue;
-             auto& c0=d["choices"][0];
-             if (c0.contains("delta")){
-                 auto& delta=c0["delta"];
-                 if (delta.contains("content") && delta["content"].is_string())
-                     out+=delta["content"].get<string>();
-             }
-             if (c0.contains("finish_reason") && c0["finish_reason"].is_string())
-                 finish=c0["finish_reason"].get<string>();
-         }catch(...){ /* keepalive / non-json line: skip */ }
-     }
-     return out;
- }
- // the zarnkina relay's NON-STREAM path garbles its reasoning models (returns a
- // truncated fragment with inconsistent usage); its STREAM path is clean.
- // so we request SSE from this provider and reassemble content from deltas.
- static bool provider_needs_stream(const string& p){ return p=="scandata-relay.zarnkina.workers.dev"; }
+// Incremental SSE decoder; chunks may split anywhere, including UTF-8.
+struct sse_decoder {
+    string pending, content, finish, error;
+    bool done=false;
+    function<void(const string&)> emit;
+    void feed(const char* data, size_t n){
+        pending.append(data,n);
+        size_t pos;
+        while ((pos=pending.find('\n'))!=string::npos){
+            string line=pending.substr(0,pos); pending.erase(0,pos+1);
+            if (!line.empty() && line.back()=='\r') line.pop_back();
+            if (line.rfind("data:",0)!=0 || done) continue;
+            string payload=line.substr(5);
+            if (!payload.empty() && payload.front()==' ') payload.erase(0,1);
+            if (payload=="[DONE]"){ done=true; continue; }
+            if (payload.empty()) continue;
+            try {
+                auto d=json::parse(payload);
+                if (d.contains("error")){ error="provider stream error"; continue; }
+                if (!d.contains("choices") || !d["choices"].is_array() || d["choices"].empty()) continue;
+                auto& c=d["choices"][0];
+                if (c.contains("delta") && c["delta"].contains("content") && c["delta"]["content"].is_string()){
+                    string text=c["delta"]["content"].get<string>();
+                    content+=text; if (emit) emit(text);
+                }
+                if (c.contains("finish_reason") && c["finish_reason"].is_string()) finish=c["finish_reason"].get<string>();
+            } catch (const exception&){ error="malformed SSE event"; }
+        }
+    }
+};
+
  
 class chat_backend{
     public:
@@ -243,23 +241,34 @@ class chat_backend{
         //   "retry"   - transient (429/5xx/connect/parse), retry with backoff
         //   "novision"- provider 400 rejecting image parts; strip images, retry
         //   "fatal"   - other 4xx; retrying is pointless, fail fast
-        string attempt(const string& model, const json& context, string& err){
+        string attempt(const string& model, const json& context, string& err,
+                     function<void(const string&)> emit={}){
             err.clear();
             json m; m["model"]=model;
-            m["stream"]=provider_needs_stream(provider);
+            m["stream"]=true;
             m["messages"]=context;
             string path = path_for_provider(provider);
-            auto res=cli->Post(path.c_str(), m.dump(), "application/json");
+            string request=m.dump(), raw;
+            sse_decoder decoder; decoder.emit=emit;
+            auto res=cli->Post(path.c_str(), request.size(),
+                [&](size_t offset, size_t length, httplib::DataSink& sink){
+                    return sink.write(request.data()+offset,length);
+                }, "application/json",
+                [&](const char* data, size_t n){
+                    raw.append(data,n); decoder.feed(data,n); return true;
+                });
             if (res && res->status==200){
                 try{
-                    if (provider_needs_stream(provider)){
-                        string finish;
-                        string content=parse_sse_content(res->body, finish);
-                        if (content.empty())
-                            { cerr<<"stream: no content (finish="<<finish<<")\n"; err="retry"; return ""; }
-                        return content;
+                    if (!decoder.content.empty() || raw.find("data:")!=string::npos){
+                        decoder.feed("\n",1);
+                        bool clean = decoder.done || (!decoder.content.empty() && decoder.finish=="stop");
+                        if (!clean || !decoder.error.empty() || decoder.finish=="length" || decoder.content.empty()){
+                            cerr<<"stream incomplete: "<<decoder.error<<" finish="<<decoder.finish<<"\n";
+                            err=decoder.content.empty()?"retry":"fatal"; return "";
+                        }
+                        return decoder.content;
                     }
-                    auto resp_json=json::parse(res->body);
+                    auto resp_json=json::parse(raw);
                     if (!resp_json.contains("choices") || resp_json["choices"].empty())
                         { cerr<<"unexpected response shape\n"; err="retry"; return ""; }
                     return resp_json["choices"][0]["message"]["content"].get<string>();
@@ -270,19 +279,17 @@ class chat_backend{
                 }
                 return "";
             }
-            string body = res ? res->body : "";
+            string body = raw;
             int st = res ? res->status : 0;
             if (!res){
-                cerr<<"http error: failed to connect\n"; err="retry"; return "";
+                cerr<<"http error: connection interrupted\n";
+                err=decoder.content.empty()?"retry":"fatal"; return "";
             }
             cerr<<"http error: status "<<st<<"\nbody:\n"<<body<<'\n';
             if (st==413){
-                // request too large: not a transient failure. signal the caller
-                // to shrink the payload (drop images, then hard-compact).
                 err="toolarge"; return "";
             }
             if (st==401 || st==403){
-                // credentials rejected: retrying can never fix it
                 err="fatal"; return "";
             }
             if (st==400){
@@ -304,7 +311,7 @@ class chat_backend{
         // retry with growing waits, image-rejections strip images once and
         // continue, other 4xx abort immediately (retrying a permanent error
         // just burns the budget).
-        string generate(const string& model, const json& context){
+        string generate(const string& model, const json& context, function<void(const string&)> emit={}){
             static constexpr int MAX_TRIES=10;
             json ctx=context;
             bool stripped=false;
@@ -318,14 +325,14 @@ class chat_backend{
                     build();
                 }
                 string err;
-                string out=attempt(model, ctx, err);
+                string out=attempt(model, ctx, err, emit);
                 if (!out.empty()) return out;
                 if ((err=="novision" || err=="toolarge") && !stripped && has_image(ctx)){
                     cerr<<"dropping image parts and retrying\n";
                     if (err=="novision") g_vision_denied=true;
                     ctx=strip_images(ctx);
                     stripped=true;
-                    out=attempt(model, ctx, err);
+                    out=attempt(model, ctx, err, emit);
                     if (!out.empty()) return out;
                 }
                 if (err=="toolarge"){
@@ -340,7 +347,6 @@ class chat_backend{
                     size_t after=ctx.dump().size();
                     cerr<<"context too large; compacted "<<before<<" -> "<<after<<" bytes\n";
                     if (after>=before){
-                        // nothing left to drop: the request itself is the floor
                         cerr<<"cannot shrink context any further ("<<after<<" bytes)\n";
                         return "[provider rejected the request even after compaction; it is too large for "+provider+" "+model+"]";
                     }
@@ -842,7 +848,34 @@ class agent{
                     sendmodel="deepseek-v4.1-flash-1017";
                     cerr<<"image in context; using "<<sendmodel<<" for this request\n";
                 }
-                string rsp=chat.generate(sendmodel, ctx);
+                // streaming display: prose reaches the terminal as it arrives;
+                // the moment a tool header (or an xml-call signature) appears
+                // the display hides the rest - payloads never reach the screen.
+                string held; size_t sd_frozen=0; bool sd_hidden=false;
+                const string bad_sig = string("<f")+"unction_calls>";
+                const string bad_open = string("<f")+"unction=";
+                auto display=[&](const string& t){
+                    if (sd_hidden) return;
+                    held+=t;
+                    size_t p=held.find(toolh);
+                    if (p==string::npos) p=held.find(bad_sig);
+                    if (p==string::npos) p=held.find(bad_open);
+                    if (p!=string::npos){ sd_hidden=true; return; }
+                    // withhold a small tail: a header straddling two chunks
+                    // must never leak the first half before the second
+                    size_t stop = held.size()>32 ? held.size()-32 : 0;
+                    while (stop>0 && (unsigned char)held[stop]>=0x80 && (unsigned char)held[stop]<=0xBF) stop--;
+                    if (stop>sd_frozen){
+                        string part=held.substr(sd_frozen, stop-sd_frozen);
+                        ind_.prose(part);
+                        cout<<part<<flush;
+                        sd_frozen=stop;
+                    }
+                };
+                function<void(const string&)> emit = ui_on()
+                    ? function<void(const string&)>(display)
+                    : function<void(const string&)>{};
+                string rsp=chat.generate(sendmodel, ctx, emit);
                 ctx.push_back({{"role", "assistant"}, {"content", rsp}});
                 save_ctx();
 
@@ -873,15 +906,25 @@ class agent{
                 }
 
                 size_t headerpos=rsp.find(toolh);
+                if (ui_on() && !sd_hidden && sd_frozen<rsp.size()){
+                    // no tool header: the answer is plain prose - flush the
+                    // withheld tail so the whole reply lands on screen.
+                    string part=rsp.substr(sd_frozen);
+                    ind_.prose(part);
+                    cout<<part<<flush;
+                    sd_frozen=rsp.size();
+                }
                 if (headerpos==string::npos){
                     ind_.end();
                     opmem_done(rsp);
-                    return rsp;
+                    return ui_on()? string("") : rsp;
                 }
-                // print any prose before the first tool header (flushed so
-                // a pty parent sees progress mid-turn)
-                ind_.prose(rsp.substr(0, headerpos));
-                cout<<rsp.substr(0, headerpos)<<flush;
+                if (!ui_on()){
+                    // print any prose before the first tool header (flushed so
+                    // a pty parent sees progress mid-turn)
+                    ind_.prose(rsp.substr(0, headerpos));
+                    cout<<rsp.substr(0, headerpos)<<flush;
+                }
 
                 string toolres=toolrestag+"\n";
                 bool any=false;
@@ -932,7 +975,27 @@ class agent{
                         if (tool.contains("tool"))
                             tnames.push_back(tool.value("tool", string("")));
                         ind_.set_tag("tool "+tool.value("tool", string("")));
-                        toolres+=dispatch_tool(tool);
+                        if (ui_on()){
+                            ind_.prose("\n");
+                            cout<<"  \xe2\x94\x8c\xe2\x94\x80 "<<tool.value("tool", string(""))
+                                 <<" #"<<safe_id(tool)<<"\n"<<flush;
+                        }
+                        auto t0=chrono::steady_clock::now();
+                        string tres=dispatch_tool(tool);
+                        if (ui_on()){
+                            istringstream ls(tres); string line; int n=0;
+                            while (n<6 && getline(ls,line)){
+                                for (char& c : line) if (unsigned(c)<32) c=' ';
+                                if (line.size()>160) line=line.substr(0,160)+"\xe2\x80\xa6";
+                                cout<<"  \xe2\x94\x82 "<<line<<"\n"; n++;
+                            }
+                            if (ls.peek()!=EOF)
+                                cout<<"  \xe2\x94\x82 \xe2\x80\xa6 (full result kept for the model)\n";
+                            double dt=chrono::duration<double>(chrono::steady_clock::now()-t0).count();
+                            char tbuf[32]; snprintf(tbuf,sizeof(tbuf),"%.2f",dt);
+                            cout<<"  \xe2\x94\x94\xe2\x94\x80 "<<tres.size()<<" bytes \xc2\xb7 "<<tbuf<<"s\n"<<flush;
+                        }
+                        toolres+=tres;
                         any=true;
                     }
                     cursor=arr_end;
