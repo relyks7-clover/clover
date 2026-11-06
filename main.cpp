@@ -1049,6 +1049,20 @@ class agent{
                     save_ctx();
                     continue;
                 }
+                // cap an oversized tool result before it enters the transcript:
+                // a raw run_command/read_file dump can exceed the per-model budget
+                // and would survive save_ctx's trim until the NEXT compact().
+                // keep head and tail; mark the cut so the model knows it was trimmed.
+                {
+                    static constexpr size_t TOOLRES_MAX=196*1024;
+                    if (toolres.size()>TOOLRES_MAX){
+                        size_t keep=(TOOLRES_MAX-192)/2;
+                        string cut="\n[...tool result truncated: "+to_string(toolres.size())+
+                                       " bytes; head "+to_string(keep)+" + tail "+to_string(keep)+
+                                       " kept for the model...]\n";
+                        toolres=toolres.substr(0,keep)+cut+toolres.substr(toolres.size()-keep);
+                    }
+                }
                 ctx.push_back({{"role", "user"}, {"content", attach_images(toolres, model)}});
                 ctx.push_back({{"role", "user"}, {"content", toolcontinue}});
                 save_ctx();
