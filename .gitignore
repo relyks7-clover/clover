@@ -40,3 +40,9 @@ wallet/
 
 # self-modification recovery snapshots - local only, source-only, never ship
 archives/
+
+# nitromta bounty scratch (secrets: keys, dkim.pem, config return_path_key)
+nitromta-run/
+ntm-work/
+ntm-cap/
+ntm021/
