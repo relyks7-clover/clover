@@ -46,3 +46,5 @@ nitromta-run/
 ntm-work/
 ntm-cap/
 ntm021/
+.openwork/
+.wp-cli/
