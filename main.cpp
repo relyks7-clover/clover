@@ -9,6 +9,45 @@
 using namespace std;
 using json=nlohmann::json;
 
+// largest prefix of s that is valid UTF-8. a byte-slice that cuts a
+// multibyte character produces invalid UTF-8, which makes every later
+// strict dump() throw. callers slicing at a byte limit must land on a
+// char boundary first.
+static size_t utf8_ok_prefix(const string& s){
+    size_t i=0;
+    while (i<s.size()){
+        unsigned char c=s[i];
+        size_t len;
+        if (c<0x80) len=1;
+        else if ((c&0xE0)==0xC0) len=2;
+        else if ((c&0xF0)==0xE0) len=3;
+        else if ((c&0xF8)==0xF0) len=4;
+        else { i++; continue; } // invalid lead: skip the byte
+        if (i+len>s.size()) return i;
+        bool ok=true;
+        for (size_t k=1;k<len;k++) if (((unsigned char)s[i+k]&0xC0)!=0x80) { ok=false; break; }
+        if (!ok) return i;
+        i+=len;
+    }
+    return i;
+}
+
+// nlohmann strict dump() throws type_error.316 on invalid UTF-8, and an
+// uncaught throw in the agent loop is std::terminate. tool results can carry
+// arbitrary bytes (binary-safe read_file, raw shell output), so every
+// context serialization goes through this: invalid bytes become U+FFFD,
+// never an exception.
+static string safe_dump(const json& j, int indent=-1){
+    try{
+        return j.dump(indent, ' ', false, nlohmann::detail::error_handler_t::replace);
+    } catch (const exception& e){
+        cerr<<"dump failed: "<<e.what()<<"\n";
+        return indent<0 ? "[unserializable]" : "{\n  [unserializable]\n}";
+    } catch (...){
+        return indent<0 ? "[unserializable]" : "{\n  [unserializable]\n}";
+    }
+}
+
 static const string toolh="[TOOL]";
 static const string toolcontinue="<continue>";
 static const string toolrestag="[tool results]";
@@ -248,7 +287,7 @@ class chat_backend{
             m["stream"]=true;
             m["messages"]=context;
             string path = path_for_provider(provider);
-            string request=m.dump(), raw;
+            string request=safe_dump(m), raw;
             sse_decoder decoder; decoder.emit=emit;
             auto res=cli->Post(path.c_str(), request.size(),
                 [&](size_t offset, size_t length, httplib::DataSink& sink){
@@ -339,12 +378,12 @@ class chat_backend{
                     // the provider's true limit is unknown: halve the CURRENT
                     // payload, not a fixed constant, so a small-but-rejected
                     // request still loses half its history each round.
-                    size_t before=ctx.dump().size();
+                    size_t before=safe_dump(ctx).size();
                     size_t target=before/2;
                     if (target<4000) target=4000;
                     shrink++;
                     ctx=trim_context_bytes(ctx, target);
-                    size_t after=ctx.dump().size();
+                    size_t after=safe_dump(ctx).size();
                     cerr<<"context too large; compacted "<<before<<" -> "<<after<<" bytes\n";
                     if (after>=before){
                         cerr<<"cannot shrink context any further ("<<after<<" bytes)\n";
@@ -613,10 +652,10 @@ static json trim_context_bytes(const json& messages, size_t max_bytes){
     vector<size_t> suffix(messages.size()+1, 0);
     for (size_t i=messages.size(); i>first; ){
         --i;
-        suffix[i]=suffix[i+1]+messages[i].dump().size();
+        suffix[i]=suffix[i+1]+safe_dump(messages[i]).size();
     }
     size_t sysbytes=0;
-    for (size_t i=0;i<first;i++) sysbytes+=messages[i].dump().size();
+    for (size_t i=0;i<first;i++) sysbytes+=safe_dump(messages[i]).size();
     auto size_at=[&](size_t s){ return sysbytes + (s<messages.size()?suffix[s]:0); };
     size_t start=first;
     while (start<messages.size() && size_at(start)>max_bytes)
@@ -673,7 +712,7 @@ class context_store{
             {
                 ofstream f(tmp, ios::binary|ios::trunc);
                 if (!f.is_open()){ cerr<<"cannot open "<<tmp<<" for writing\n"; return false; }
-                f<<doc.dump(2);
+                f<<safe_dump(doc,2);
                 f.flush();
                 if (!f.good()){ cerr<<"write error to "<<tmp<<"\n"; return false; }
             }
@@ -762,9 +801,9 @@ class agent{
         // screenshot is worth less than the exchanges it would evict.
         void compact(){
             size_t budget=context_budget_bytes(model, chat.provider);
-            if (ctx.dump().size()<=budget) return;
+            if (safe_dump(ctx).size()<=budget) return;
             json lean=strip_images(ctx);
-            if (lean.dump().size()<=budget){ ctx=lean; return; }
+            if (safe_dump(lean).size()<=budget){ ctx=lean; return; }
             ctx=trim_context_bytes(lean, budget);
         }
         agent(const string& modelname, const string& sysprompt, const string& agentname,
@@ -906,7 +945,18 @@ class agent{
                 function<void(const string&)> emit = ui_on()
                     ? function<void(const string&)>(display)
                     : function<void(const string&)>{};
-                string rsp=chat.generate(sendmodel, ctx, emit);
+                string rsp;
+                try{ rsp=chat.generate(sendmodel, ctx, emit); }
+                catch (const exception& e){
+                    cerr<<"internal error in agent loop: "<<e.what()<<"\n";
+                    ctx.push_back({{"role","user"},{"content",string("harness internal error: ")+e.what()+string(" - if you just issued a tool call it may not have executed; re-check state before retrying. ")}});
+                    save_ctx(); continue;
+                }
+                catch (...){
+                    cerr<<"internal error in agent loop (unknown)" "\n";
+                    ctx.push_back({{"role","user"},{"content","harness internal error - if you just issued a tool call it may not have executed; re-check state before retrying."}});
+                    save_ctx(); continue;
+                }
                 ctx.push_back({{"role", "assistant"}, {"content", rsp}});
                 save_ctx();
 
@@ -1060,7 +1110,10 @@ class agent{
                         string cut="\n[...tool result truncated: "+to_string(toolres.size())+
                                        " bytes; head "+to_string(keep)+" + tail "+to_string(keep)+
                                        " kept for the model...]\n";
-                        toolres=toolres.substr(0,keep)+cut+toolres.substr(toolres.size()-keep);
+                        size_t head=std::min(keep, utf8_ok_prefix(toolres));
+                        size_t tl=toolres.size()-keep;
+                        size_t tailpos=tl+utf8_ok_prefix(toolres.substr(tl));
+                        toolres=toolres.substr(0,head)+cut+toolres.substr(tailpos);
                     }
                 }
                 ctx.push_back({{"role", "user"}, {"content", attach_images(toolres, model)}});
@@ -1085,8 +1138,9 @@ static int run_test(agent& a, chat_backend& chat){
     while (!message.empty() && (message.back()=='\n'||message.back()=='\r')) message.pop_back();
     if (message.empty()){ cerr<<"test mode: empty stdin\n"; return 1; }
     print_header(a, chat.provider);
-    cout<<a.f(message);
-    cout<<'\n';
+    try{ cout<<a.f(message); cout<<'\n'; }
+    catch (const exception& e){ cerr<<"turn error: "<<e.what()<<"\n"; cout<<"[turn failed: "<<e.what()<<"\n"; }
+    catch (...){ cerr<<"turn error: unknown exception" "\n"; cout<<"[turn failed: unknown error]" "\n"; }
     return 0;
 }
 
@@ -1128,8 +1182,9 @@ static int run_convo(agent& a, chat_backend& chat){
             break;
         } else {
             print_header(a, chat.provider);
-            cout<<a.f(message);
-            cout<<'\n';
+            try{ cout<<a.f(message); cout<<'\n'; }
+            catch (const exception& e){ cerr<<"turn error: "<<e.what()<<"\n"; cout<<"[turn failed: "<<e.what()<<"\n"; }
+            catch (...){ cerr<<"turn error: unknown exception" "\n"; cout<<"[turn failed: unknown error]" "\n"; }
         }
     }
     return 0;
