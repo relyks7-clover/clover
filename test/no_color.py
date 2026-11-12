@@ -38,11 +38,14 @@ while time.time() < end:
     if b"r1" in buf:
         break
 assert b"r1" in buf, "spinner missing"
+# ctrl-c mid-turn now interrupts the turn and returns to the prompt
+# (the agent must survive it); then quit cleanly.
 os.kill(pid, signal.SIGINT)
-while True:
-    r, _, _ = select.select([fd], [], [], 1.0)
+end = time.time() + 20
+while time.time() < end:
+    r, _, _ = select.select([fd], [], [], 0.5)
     if not r:
-        break
+        continue
     try:
         c = os.read(fd, 4096)
     except OSError:
@@ -50,7 +53,23 @@ while True:
     if not c:
         break
     buf += c
-os.waitpid(pid, 0)
+    if b"[interrupted]" in buf:
+        break
+os.write(fd, b"/quit\n")
+end = time.time() + 20
+while time.time() < end:
+    r, _, _ = select.select([fd], [], [], 0.5)
+    if not r:
+        continue
+    try:
+        c = os.read(fd, 4096)
+    except OSError:
+        break
+    if not c:
+        break
+    buf += c
+status, _ = os.waitpid(pid, 0)
+print("interrupted_seen:", b"[interrupted]" in buf)
 color_seqs = re.findall(rb"\x1b\[[0-9;]*m", buf)
 print("sgr_color_sequences:", len(color_seqs))
 print("title_seq:", buf.count(b"\x1b]0;"))

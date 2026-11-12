@@ -45,7 +45,8 @@ void append(session& s, const char* buf, size_t n){
         s.out.erase(0, s.out.size()-MAX_OUT);
 }
 
-// pump returns: 0 = child eof/error (exiting), 1 = idle (prompt), 2 = deadline hit (killed).
+// pump returns: 0 = child eof/error (exiting), 1 = idle (prompt),
+// 2 = deadline hit (killed), 3 = user interrupt (killed).
 int pump(session& s, int idle_ms){
     char buf[4096];
     for(;;){
@@ -55,6 +56,7 @@ int pump(session& s, int idle_ms){
             if (remain<=0){ kill(-s.pid, SIGKILL); return 2; }
             if (remain<wait_ms) wait_ms=(int)remain;
         }
+        if (clover_cancel && wait_ms>100) wait_ms=100; // react fast to ctrl-c
         struct pollfd pfd{s.fd, POLLIN, 0};
         int pr=poll(&pfd, 1, wait_ms);
         if (pr<0){
@@ -62,6 +64,7 @@ int pump(session& s, int idle_ms){
             return 0;
         }
         if (pr==0){
+            if (clover_cancel){ kill(-s.pid, SIGKILL); return 3; }
             if (s.deadline && (long)(s.deadline - time(nullptr))<=0){ kill(-s.pid, SIGKILL); return 2; }
             return 1; // quiet while alive -> prompt
         }
@@ -130,6 +133,15 @@ std::string finish_message(int st, const std::string& out){
 // prompt and the caller keeps the session.
 void drive(session& s, std::string& result, bool& finished){
     int p=pump(s, IDLE_MS);
+    if (p==3){
+        // ctrl-c: the whole group was killed in pump; reap and report.
+        int st=0;
+        while (waitpid(s.pid, &st, 0)<0 && errno==EINTR) {}
+        drain(s);
+        result="interrupted by user (ctrl-c); process killed; output so far:\n"+s.out+"\n";
+        finished=true;
+        return;
+    }
     if (p==2){
         // deadline: the whole group was killed in pump; reap and report.
         int st=0;
@@ -150,6 +162,14 @@ void drive(session& s, std::string& result, bool& finished){
             if (still!=1) break; // eof, or deadline (handled below)
         }
         p=pump(s, IDLE_MS);
+        if (p==3){
+            int st=0;
+            while (waitpid(s.pid, &st, 0)<0 && errno==EINTR) {}
+            drain(s);
+            result="interrupted by user (ctrl-c); process killed; output so far:\n"+s.out+"\n";
+            finished=true;
+            return;
+        }
         if (p==2){
             int st=0;
             while (waitpid(s.pid, &st, 0)<0 && errno==EINTR) {}
@@ -326,4 +346,4 @@ static std::string tool_run_command(const nlohmann::json& args, tool_context&){
 REGISTER_TOOL_DESC("run_command", tool_run_command,
 R"(run_command(command, timeout?):
 -runs a command in my ubuntu 24.04 sandbox; optional timeout (1-3600s) bounds total runtime and kills the whole process group on expiry
--if the command goes quiet for 30s while still running, returns with a session_id; reply by calling run_command again with {"session_id": N, "input": "text"} or {"session_id": N, "cancel": true}; empty input keeps waiting)");
+-if the command goes quiet for 30s while still running, returns with a session_id; reply by calling run_command again with {"session_id": N, "input": "text"} or {"session_id": N, "cancel": true}; empty input keeps waiting. a ctrl-c from the user interrupts the command and the agent keeps running)");

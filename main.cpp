@@ -48,6 +48,14 @@ static string safe_dump(const json& j, int indent=-1){
     }
 }
 
+// interrupt flags, set by the tty signal handler (sig handlers may only
+// write sig_atomic_t and call async-signal-safe functions).
+volatile sig_atomic_t clover_cancel=0;
+// 1 while a turn is running: the SIGINT handler turns ctrl-c into a
+// mid-turn interrupt (clover_cancel) instead of terminating the process.
+// at the prompt a handler cannot unblock getline, so the process exits.
+volatile sig_atomic_t g_turn_active=0;
+
 static const string toolh="[TOOL]";
 static const string toolcontinue="<continue>";
 static const string toolrestag="[tool results]";
@@ -73,9 +81,16 @@ static void ui_terminate_reset(int sig){
     signal(sig, SIG_DFL);
     raise(sig);
 }
+static void ui_interrupt(int sig){
+    // ctrl-c mid-turn aborts the current operation (stream, tool, backoff)
+    // and the agent returns to the prompt. at the prompt a handler cannot
+    // unblock the pending read, so the session terminates as before.
+    if (g_turn_active) clover_cancel=1;
+    else ui_terminate_reset(sig);
+}
 static void ui_install_terminate_guard(){
     if (!ui_on()) return;
-    signal(SIGINT,  ui_terminate_reset);
+    signal(SIGINT,  ui_interrupt);
     signal(SIGTERM, ui_terminate_reset);
     signal(SIGHUP,  ui_terminate_reset);
     signal(SIGQUIT, ui_terminate_reset);
@@ -162,9 +177,9 @@ struct turn_indicator{
 };
 
 struct config{
-    string provider="scandata-relay.zarnkina.workers.dev";
+    string provider="logfare.ai";
     string web_provider="api.langsearch.com";
-    string model="zarnkina-gpt-6.1-sol";
+    string model="qwen-3.8-27b";
     string promptfile="sysprompts/clover.txt";
     string web_key=getenv("CLOVER_WEB_KEY")?getenv("CLOVER_WEB_KEY"):"";
     string ctxfile="context.json";
@@ -294,8 +309,19 @@ class chat_backend{
                     return sink.write(request.data()+offset,length);
                 }, "application/json",
                 [&](const char* data, size_t n){
+                    if (clover_cancel) return false; // abort the stream
                     raw.append(data,n); decoder.feed(data,n); return true;
                 });
+            if (clover_cancel){
+                // ctrl-c mid-request: return what already streamed (matches
+                // what the user saw), or abort the attempt when nothing did.
+                if (!decoder.content.empty()){
+                    cerr<<"interrupted: returning partial stream ("<<decoder.content.size()<<" bytes)\n";
+                    return decoder.content;
+                }
+                cerr<<"interrupted: request aborted\n";
+                err="fatal"; return "";
+            }
             if (res && res->status==200){
                 try{
                     if (!decoder.content.empty() || raw.find("data:")!=string::npos){
@@ -359,13 +385,26 @@ class chat_backend{
             for (int t=0;t<MAX_TRIES;t++){
                 if (t>0 && shrink==0){
                     cerr<<"generate retry "<<t+1<<"/"<<MAX_TRIES<<" in "<<backoff_ms<<"ms\n";
-                    this_thread::sleep_for(chrono::milliseconds(backoff_ms));
+                    // interruptible sleep: ctrl-c during backoff aborts the
+                    // turn instead of making the user wait out the delay.
+                    for (int w=0; w<backoff_ms && !clover_cancel; w+=100)
+                        this_thread::sleep_for(chrono::milliseconds(100));
+                    if (clover_cancel){
+                        cerr<<"generate interrupted during backoff\n";
+                        return "[interrupted by user]";
+                    }
                     backoff_ms*=5; if (backoff_ms>60000) backoff_ms=60000;
                     build();
                 }
                 string err;
                 string out=attempt(model, ctx, err, emit);
                 if (!out.empty()) return out;
+                if (clover_cancel){
+                    // ctrl-c during the request: do not retry or re-request,
+                    // abort the turn cleanly.
+                    cerr<<"generate interrupted\n";
+                    return "[interrupted by user]";
+                }
                 if ((err=="novision" || err=="toolarge") && !stripped && has_image(ctx)){
                     cerr<<"dropping image parts and retrying\n";
                     if (err=="novision") g_vision_denied=true;
@@ -421,7 +460,7 @@ class web_backend{
         }
         string search(const string& query){
             json m;
-            m["query"]=query; m["count"]=10;
+            m["query"]=jsanitize(query); m["count"]=10;
             m["contents"]={{"text",true}};
             m["freshness"]="noLimit";
             cerr<<"web search: "<<query<<'\n';
@@ -430,9 +469,9 @@ class web_backend{
             // path's heavy one.
             for (int t=0;t<3;t++){
                 if (t>0) this_thread::sleep_for(chrono::milliseconds(1500<<t));
-                auto res=cli->Post("/v1/web-search", m.dump(), "application/json");
+                auto res=cli->Post("/v1/web-search", safe_dump(m), "application/json");
                 if (res && res->status==200){
-                    try{ return json::parse(res->body).dump(); }
+                    try{ return safe_dump(json::parse(res->body)); }
                     catch (const json::parse_error& e){ cerr<<"web search json parse error:\n"<<e.what()<<'\n'; }
                 } else if (res){
                     cerr<<"web search http error: status "<<res->status<<'\n';
@@ -748,8 +787,8 @@ static string safe_id(const json& tool){
     const json& id=tool["id"];
     if (id.is_number_integer()) return to_string(id.get<long long>());
     if (id.is_number()) return to_string(id.get<double>());
-    if (id.is_string()) return id.get<string>();
-    return id.dump();
+    if (id.is_string()) return id.get<std::string>();
+    return jdump(id);
 }
 
 // replaces every occurrence of marker in out with value, left to right,
@@ -890,6 +929,7 @@ class agent{
         // processes one assistant reply: prints leading text, runs any tool
         // blocks, then continues the conversation until a non-tool reply.
         string f(const string& msg){
+            clover_cancel=0;
             ind_.begin(name);
             ctx.push_back({{"role", "user"}, {"content", msg}});
             save_ctx();
@@ -1178,13 +1218,22 @@ static int run_convo(agent& a, chat_backend& chat){
             else cout<<"usage: /provider [provider]\n";
         } else if (cmd[0]=="/help"){
             cout<<"/clear_ctx  /model <m>  /provider <p>  /help  /quit\n";
+            cout<<"  ctrl-c mid-turn aborts the current operation and returns to the prompt\n";
         } else if (cmd[0]=="/quit" || cmd[0]=="/exit"){
             break;
         } else {
             print_header(a, chat.provider);
+            g_turn_active=1;
             try{ cout<<a.f(message); cout<<'\n'; }
             catch (const exception& e){ cerr<<"turn error: "<<e.what()<<"\n"; cout<<"[turn failed: "<<e.what()<<"\n"; }
             catch (...){ cerr<<"turn error: unknown exception" "\n"; cout<<"[turn failed: unknown error]" "\n"; }
+            g_turn_active=0;
+            if (clover_cancel){
+                // the turn aborted itself (interrupted stream/tool/backoff):
+                // say so and start the next prompt with a clean slate.
+                clover_cancel=0;
+                cout<<"\n[interrupted]\n";
+            }
         }
     }
     return 0;

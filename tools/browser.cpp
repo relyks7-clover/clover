@@ -177,6 +177,7 @@ static std::string launch(){
 
     std::string page_ws;
     for (int i = 0; i < 100; i++){ // 20s
+        if (clover_cancel) return "interrupted by user\n";
         {
             httplib::Client cli("127.0.0.1", port);
             cli.set_connection_timeout(1, 0);
@@ -260,6 +261,7 @@ static std::string cdp(const std::string& method, const json& params,
                     std::chrono::seconds(timeout_s);
     std::string buf;
     while (std::chrono::steady_clock::now() < deadline){
+        if (clover_cancel) return "interrupted by user\n";
         buf.clear();
         auto r = ST.ws->read(buf);
         if (r == httplib::ws::ReadResult::Text){
@@ -292,6 +294,7 @@ static void wait_load(int timeout_s){
                     std::chrono::seconds(timeout_s);
     std::string buf;
     while (!ST.seen_load && std::chrono::steady_clock::now() < deadline){
+        if (clover_cancel) return;
         buf.clear();
         auto r = ST.ws->read(buf);
         if (r == httplib::ws::ReadResult::Text){

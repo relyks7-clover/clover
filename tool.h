@@ -2,7 +2,55 @@
 #include <string>
 #include <vector>
 #include <functional>
+#include <csignal>
 #include "json.hpp"
+
+// host-level interrupt: the tty SIGINT handler sets clover_cancel; long
+// operations (tool pumps, cdp waits, provider streams, backoff sleeps) poll
+// it so ctrl-c aborts the current operation instead of needing a kill.
+extern volatile sig_atomic_t clover_cancel;
+
+// strict dump throws type_error.316 on invalid UTF-8 in string values; page,
+// shell, and provider bytes are arbitrary, so dump with replacement instead.
+static inline std::string jdump(const nlohmann::json& j){
+    try{ return j.dump(-1, ' ', false, nlohmann::detail::error_handler_t::replace); }
+    catch(...){ return "[unserializable]"; }
+}
+
+// replaces invalid UTF-8 sequences with U+FFFD. json string values must be
+// valid UTF-8 and the sources of our strings (model args, shells, pages)
+// are not guaranteed to be; sanitizing at the boundary means no json
+// operation on the data can ever throw a type_error.
+static inline std::string jsanitize(std::string s){
+    const char RPL[3] = {0xEF, 0xBF, 0xBD};
+    std::string o; o.reserve(s.size());
+    size_t i = 0, n = s.size();
+    auto cont = [&](size_t k) { // k continuation bytes at i+1..i+k
+        for (size_t j = 1; j <= k; j++)
+            if (i + j >= n || (unsigned char)s[i+j] < 0x80 || (unsigned char)s[i+j] > 0xBF) return false;
+        return true;
+    };
+    while (i < n){
+        unsigned char c = (unsigned char)s[i];
+        bool ok = false;
+        if (c < 0x80) ok = true;
+        else if (c >= 0xC2 && c <= 0xDF) ok = cont(1);
+        else if (c == 0xE0) ok = cont(1) && (unsigned char)s[i+1] >= 0xA0;
+        else if (c >= 0xE1 && c <= 0xEC) ok = cont(2);
+        else if (c == 0xED) ok = cont(1) && (unsigned char)s[i+1] <= 0x9F;
+        else if (c >= 0xEE && c <= 0xEF) ok = cont(2);
+        else if (c == 0xF0) ok = cont(3) && (unsigned char)s[i+1] >= 0x90;
+        else if (c >= 0xF1 && c <= 0xF3) ok = cont(3);
+        else if (c == 0xF4) ok = cont(3) && (unsigned char)s[i+1] <= 0x8F;
+        if (ok){
+            size_t len = c < 0x80 ? 1 : c < 0xE0 ? 2 : c < 0xF0 ? 3 : 4;
+            o.append(s, i, len); i += len;
+        } else {
+            o.append(RPL, 3); i++;
+        }
+    }
+    return o;
+}
 
 // services a tool may use. keeps tools decoupled from backend types: the
 // host supplies callables. add fields here as new shared services appear.
