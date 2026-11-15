@@ -6,6 +6,8 @@
 memory/
 context.json
 a.out
+a.out.new
+*.prev
 *.o
 
 # autonomy runtime: task queue, ledger, works registry, sources .clover.env - never ships
@@ -48,3 +50,7 @@ ntm-cap/
 ntm021/
 .openwork/
 .wp-cli/
+
+# tool/runtime caches - never ship
+.gemini/
+.npm/

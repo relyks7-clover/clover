@@ -9,6 +9,9 @@
 // operations (tool pumps, cdp waits, provider streams, backoff sleeps) poll
 // it so ctrl-c aborts the current operation instead of needing a kill.
 extern volatile sig_atomic_t clover_cancel;
+// set by the hot_reload tool: the agent loop re-execs the process at a
+// clean turn boundary so the shell session continues on the new binary.
+extern volatile sig_atomic_t g_hot_reload;
 
 // strict dump throws type_error.316 on invalid UTF-8 in string values; page,
 // shell, and provider bytes are arbitrary, so dump with replacement instead.

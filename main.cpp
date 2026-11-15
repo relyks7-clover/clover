@@ -51,6 +51,13 @@ static string safe_dump(const json& j, int indent=-1){
 // interrupt flags, set by the tty signal handler (sig handlers may only
 // write sig_atomic_t and call async-signal-safe functions).
 volatile sig_atomic_t clover_cancel=0;
+// set by the hot_reload tool at a tool boundary: the conversation loop
+// re-execs the process (same path, same argv) once the turn is done.
+volatile sig_atomic_t g_hot_reload=0;
+// the original command line + resolved binary path, for the in-place
+// re-exec at a clean turn boundary.
+static char** g_argv=nullptr;
+static string g_exe_path;
 // 1 while a turn is running: the SIGINT handler turns ctrl-c into a
 // mid-turn interrupt (clover_cancel) instead of terminating the process.
 // at the prompt a handler cannot unblock getline, so the process exits.
@@ -177,9 +184,9 @@ struct turn_indicator{
 };
 
 struct config{
-    string provider="logfare.ai";
+    string provider="generativelanguage.googleapis.com";
     string web_provider="api.langsearch.com";
-    string model="qwen-3.8-27b";
+    string model="gemini-4-hydrogen";
     string promptfile="sysprompts/clover.txt";
     string web_key=getenv("CLOVER_WEB_KEY")?getenv("CLOVER_WEB_KEY"):"";
     string ctxfile="context.json";
@@ -1234,13 +1241,59 @@ static int run_convo(agent& a, chat_backend& chat){
                 clover_cancel=0;
                 cout<<"\n[interrupted]\n";
             }
+            if (g_hot_reload && !g_exe_path.empty()){
+                // hot_reload committed: swap in the new binary at a clean
+                // turn boundary. persist context, flush, re-exec the same
+                // path with the same argv - the session continues on the
+                // new code, pid and tty intact.
+                g_hot_reload=0;
+                a.save_ctx();
+                cout<<"\n[hot reload: restarting on the new binary...]"<<C_RESET<<"\n"<<flush;
+                vector<char*> av;
+                for (int i=0; g_argv && g_argv[i]; i++) av.push_back(g_argv[i]);
+                av.push_back(nullptr);
+                execv(g_exe_path.c_str(), av.data());
+                // reaching here means execv failed: stay on the old binary.
+                cerr<<"hot reload exec failed: "+string(strerror(errno))+"\n";
+            }
         }
     }
     return 0;
 }
 
 int main(int argc, char** argv){
+    g_argv=argv;
+    {
+        char buf[4096];
+        ssize_t n=readlink("/proc/self/exe", buf, sizeof(buf)-1);
+        if (n>0) g_exe_path=string(buf, (size_t)n);
+    }
     bool test=false;
+    // bootstrap provider keys from the repo's .clover.env for vars missing
+    // from the process environment: a respawned or plain-relaunched session
+    // may hold a stale env that predates a newer provider's key. existing
+    // env always wins; values are never printed.
+    {
+        std::string envfile = (!g_exe_path.empty() ? g_exe_path.substr(0, g_exe_path.rfind('/')+1) : std::string(".")) + ".clover.env";
+        std::ifstream ef(envfile);
+        if (ef.is_open()){
+            std::string line;
+            while (std::getline(ef, line)){
+                if (line.find("CLOVER_") == std::string::npos) continue;
+                size_t e = line.find('=');
+                if (e == std::string::npos) continue;
+                std::string name = line.substr(0, e);
+                size_t ns = name.find_first_not_of(" \t");
+                name = (ns == std::string::npos) ? "" : name.substr(ns);
+                if (name.rfind("export", 0) == 0){ name = name.substr(6); while (!name.empty() && name.front()==' ') name.erase(0,1); }
+                if (name.empty() || name.find('=') != std::string::npos) continue;
+                if (getenv(name.c_str())) continue;
+                std::string val = line.substr(e+1);
+                while (!val.empty() && (val.back()==' '||val.back()=='\t')) val.pop_back();
+                setenv(name.c_str(), val.c_str(), 1);
+            }
+        }
+    }
     config cfg;
     for (int i=1;i<argc;i++){
         string a=argv[i];
@@ -1338,6 +1391,13 @@ int main(int argc, char** argv){
 
     if (test) return run_test(clover, chat);
     ui_banner(clover.name, chat.provider, clover.model);
+    if (getenv("CLOVER_HOT_RELOAD")){
+        // the previous process hot-reloaded into this one: say so so the
+        // shell visibly shows the new binary. test mode is already excluded
+        // above, so this is an interactive-only line.
+        unsetenv("CLOVER_HOT_RELOAD");
+        cout<<C_CYAN<<"[reloaded: now running the new binary; rollback: "+g_exe_path+".prev]"<<C_RESET<<"\n"<<flush;
+    }
     ui_install_terminate_guard();
     return run_convo(clover, chat);
 }
