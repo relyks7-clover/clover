@@ -42,6 +42,14 @@ static std::string tool_hot_reload(const nlohmann::json& args, tool_context& ctx
     (void)args; (void)ctx;
     std::string exe = exe_path();
     if (exe.empty()) return "error: cannot resolve /proc/self/exe\n";
+    // a deleted inode (a previous swap renamed the binary out from under us)
+    // reports "<path> (deleted)"; strip the suffix and skip the rollback
+    // copy - there is no on-disk file of the running binary to keep.
+    bool deleted = false;
+    if (exe.size() > 11 && exe.compare(exe.size()-11, 11, " (deleted)") == 0){
+        deleted = true;
+        exe.erase(exe.size()-11);
+    }
     // build from the binary's own directory: the Makefile and source live
     // next to the binary in production. fall back to the process cwd if the
     // binary was copied elsewhere.
@@ -57,8 +65,7 @@ static std::string tool_hot_reload(const nlohmann::json& args, tool_context& ctx
     // keep the current binary for rollback; build the new one to a side
     // path (never over the running binary's inode - its text is mmap'd).
     std::string log = "/tmp/clover-hot-reload.log";
-    std::string cmd = "cd "+q(build_dir)+" && { cp -f "+q(exe)+" "+q(exe+".prev")
-                      +" && make a.out.new; } > "+q(log)+" 2>&1";
+    std::string cmd = "cd "+q(build_dir)+" && { "+(deleted ? "" : "cp -f "+q(exe)+" "+q(exe+".prev")+" && ")+"make a.out.new; } > "+q(log)+" 2>&1";
     int rc = system(cmd.c_str());
     int make_rc = (rc == -1) ? -1 : WEXITSTATUS(rc);
     std::string logtxt = slurp(log);

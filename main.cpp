@@ -1266,7 +1266,12 @@ int main(int argc, char** argv){
     {
         char buf[4096];
         ssize_t n=readlink("/proc/self/exe", buf, sizeof(buf)-1);
-        if (n>0) g_exe_path=string(buf, (size_t)n);
+        if (n>0){ g_exe_path=string(buf, (size_t)n);
+            // a deleted inode reports "<path> (deleted)"; strip it so a
+            // later re-exec targets the real path, not the dead string.
+            if (g_exe_path.size()>11 && g_exe_path.compare(g_exe_path.size()-11,11," (deleted)")==0)
+                g_exe_path.erase(g_exe_path.size()-11);
+        }
     }
     bool test=false;
     // bootstrap provider keys from the repo's .clover.env for vars missing
